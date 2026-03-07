@@ -1,0 +1,1278 @@
+// --- Elements ---
+const chatContainer = document.getElementById('chatContainer');
+const chatContent = document.getElementById('chatContent');
+const messageInput = document.getElementById('messageInput');
+const sendBtn = document.getElementById('sendBtn');
+const scrollToBottomBtn = document.getElementById('scrollToBottom');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const refreshBtn = document.getElementById('refreshBtn');
+const stopBtn = document.getElementById('stopBtn');
+const newChatBtn = document.getElementById('newChatBtn');
+const historyBtn = document.getElementById('historyBtn');
+
+const modeBtn = document.getElementById('modeBtn');
+const modelBtn = document.getElementById('modelBtn');
+const modalOverlay = document.getElementById('modalOverlay');
+const modalList = document.getElementById('modalList');
+const modalTitle = document.getElementById('modalTitle');
+const modeText = document.getElementById('modeText');
+const modelText = document.getElementById('modelText');
+const historyLayer = document.getElementById('historyLayer');
+const historyList = document.getElementById('historyList');
+
+// --- State ---
+let autoRefreshEnabled = true;
+let userIsScrolling = false;
+let userScrollLockUntil = 0; // Timestamp until which we respect user scroll
+let lastScrollPosition = 0;
+let ws = null;
+let idleTimer = null;
+let lastHash = '';
+let currentMode = 'Fast';
+let chatIsOpen = true; // Track if a chat is currently open
+
+// --- Toast Notification ---
+function showToast(message, duration = 3000) {
+    let toast = document.getElementById('ag-toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'ag-toast';
+        toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(30,41,59,0.95);color:#e2e8f0;padding:10px 20px;border-radius:8px;font-size:13px;z-index:9999;opacity:0;transition:opacity 0.3s;pointer-events:none;max-width:80%;text-align:center;border:1px solid rgba(59,130,246,0.3);';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = message;
+    toast.style.opacity = '1';
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, duration);
+}
+
+
+// --- Auth Utilities ---
+async function fetchWithAuth(url, options = {}) {
+    // Add ngrok skip warning header to all requests
+    if (!options.headers) options.headers = {};
+    options.headers['ngrok-skip-browser-warning'] = 'true';
+
+    try {
+        const res = await fetch(url, options);
+        if (res.status === 401) {
+            console.log('[AUTH] 401 response (auth disabled, ignoring)');
+        }
+        return res;
+    } catch (e) {
+        throw e;
+    }
+}
+const USER_SCROLL_LOCK_DURATION = 3000; // 3 seconds of scroll protection
+
+// --- Sync State (Desktop is Always Priority) ---
+async function fetchAppState() {
+    try {
+        const res = await fetchWithAuth('/app-state');
+        const data = await res.json();
+
+        // Mode Sync (Fast/Planning) - Desktop is source of truth
+        if (data.mode && data.mode !== 'Unknown') {
+            modeText.textContent = data.mode;
+            modeBtn.classList.toggle('active', data.mode === 'Planning');
+            currentMode = data.mode;
+        }
+
+        // Model Sync - Desktop is source of truth
+        if (data.model && data.model !== 'Unknown') {
+            modelText.textContent = data.model;
+        }
+
+        console.log('[SYNC] State refreshed from Desktop:', data);
+    } catch (e) { console.error('[SYNC] Failed to sync state', e); }
+}
+
+// --- SSL Banner ---
+const sslBanner = document.getElementById('sslBanner');
+
+async function checkSslStatus() {
+    // Only show banner if currently on HTTP
+    if (window.location.protocol === 'https:') return;
+
+    // Check if user dismissed the banner before
+    if (localStorage.getItem('sslBannerDismissed')) return;
+
+    sslBanner.style.display = 'flex';
+}
+
+async function enableHttps() {
+    const btn = document.getElementById('enableHttpsBtn');
+    btn.textContent = 'Generating...';
+    btn.disabled = true;
+
+    try {
+        const res = await fetchWithAuth('/generate-ssl', { method: 'POST' });
+        const data = await res.json();
+
+        if (data.success) {
+            sslBanner.innerHTML = `
+                <span>✅ ${data.message}</span>
+                <button onclick="location.reload()">Reload After Restart</button>
+            `;
+            sslBanner.style.background = 'linear-gradient(90deg, #22c55e, #16a34a)';
+        } else {
+            btn.textContent = 'Failed - Retry';
+            btn.disabled = false;
+        }
+    } catch (e) {
+        btn.textContent = 'Error - Retry';
+        btn.disabled = false;
+    }
+}
+
+function dismissSslBanner() {
+    sslBanner.style.display = 'none';
+    localStorage.setItem('sslBannerDismissed', 'true');
+}
+
+// Check SSL on load
+checkSslStatus();
+// --- Models ---
+const MODELS = [
+    "Gemini 3 Pro (High)",
+    "Gemini 3 Pro (Low)",
+    "Gemini 3 Flash ⚡",
+    "Claude Sonnet 4.5",
+    "Claude Sonnet 4.5 (Thinking)",
+    "Claude Opus 4.5 (Thinking) 💎",
+    "GPT-OSS 120B (Medium)"
+];
+
+// --- WebSocket ---
+function connectWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+    ws.onopen = () => {
+        console.log('WS Connected');
+        updateStatus(true);
+        loadSnapshot();
+    };
+
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'error' && data.message === 'Unauthorized') {
+            console.log('[AUTH] WS auth error (auth disabled, ignoring)');
+            return;
+        }
+        if (data.type === 'snapshot_update' && autoRefreshEnabled && !userIsScrolling) {
+            loadSnapshot();
+        }
+    };
+
+    ws.onclose = () => {
+        console.log('WS Disconnected');
+        updateStatus(false);
+        setTimeout(connectWebSocket, 2000);
+    };
+}
+
+function updateStatus(connected) {
+    if (connected) {
+        statusDot.classList.remove('disconnected');
+        statusDot.classList.add('connected');
+        statusText.textContent = 'Live';
+    } else {
+        statusDot.classList.remove('connected');
+        statusDot.classList.add('disconnected');
+        statusText.textContent = 'Reconnecting';
+    }
+}
+
+// --- Rendering ---
+async function loadSnapshot() {
+    try {
+        // Add spin animation to refresh button (if SVG exists)
+        const icon = refreshBtn.querySelector('svg');
+        if (icon) {
+            icon.classList.remove('spin-anim');
+            void icon.offsetWidth; // trigger reflow
+            icon.classList.add('spin-anim');
+        }
+
+        const snapshotController = new AbortController();
+        const snapshotTimeout = setTimeout(() => snapshotController.abort(), 8000); // 8s timeout
+        const response = await fetchWithAuth('/snapshot', { signal: snapshotController.signal });
+        clearTimeout(snapshotTimeout);
+        if (!response.ok) {
+            if (response.status === 503) {
+                // No snapshot available - likely no chat open
+                chatIsOpen = false;
+                showEmptyState();
+                return;
+            }
+            throw new Error('Failed to load');
+        }
+
+        // Mark chat as open since we got a valid snapshot
+        chatIsOpen = true;
+
+        const data = await response.json();
+
+        // Capture scroll state BEFORE updating content
+        const scrollPos = chatContainer.scrollTop;
+        const scrollHeight = chatContainer.scrollHeight;
+        const clientHeight = chatContainer.clientHeight;
+        const isNearBottom = scrollHeight - scrollPos - clientHeight < 120;
+        const isUserScrollLocked = Date.now() < userScrollLockUntil;
+
+        // --- UPDATE STATS ---
+        if (data.stats) {
+            const kbs = Math.round((data.stats.htmlSize + data.stats.cssSize) / 1024);
+            const nodes = data.stats.nodes;
+            const statsText = document.getElementById('statsText');
+            if (statsText) statsText.textContent = `${nodes} Nodes · ${kbs}KB`;
+        }
+
+        // --- CSS INJECTION (Cached) ---
+        let styleTag = document.getElementById('cdp-styles');
+        if (!styleTag) {
+            styleTag = document.createElement('style');
+            styleTag.id = 'cdp-styles';
+            document.head.appendChild(styleTag);
+        }
+
+        const darkModeOverrides = '/* --- BASE SNAPSHOT CSS --- */\n' +
+            data.css +
+            '\n\n/* --- FORCE DARK MODE OVERRIDES --- */\n' +
+            ':root {\n' +
+            '    --bg-app: #181818;\n' +
+            '    --text-main: #CCCCCC;\n' +
+            '    --text-muted: #858585;\n' +
+            '    --border-color: #2B2B2B;\n' +
+            '}\n' +
+            '\n' +
+            '#conversation, #chat, #cascade {\n' +
+            '    background-color: transparent !important;\n' +
+            '    color: var(--text-main) !important;\n' +
+            '    font-family: \'Inter\', system-ui, sans-serif !important;\n' +
+            '    font-size: 15px !important;\n' +
+            '    position: relative !important;\n' +
+            '    height: auto !important;\n' +
+            '    width: 100% !important;\n' +
+            '}\n' +
+            '\n' +
+            '#conversation *, #chat *, #cascade * {\n' +
+            '    position: static !important;\n' +
+            '}\n' +
+            '\n' +
+            '#conversation p, #chat p, #cascade p, #conversation h1, #chat h1, #cascade h1, #conversation h2, #chat h2, #cascade h2, #conversation h3, #chat h3, #cascade h3, #conversation h4, #chat h4, #cascade h4, #conversation h5, #chat h5, #cascade h5, #conversation span, #chat span, #cascade span, #conversation div, #chat div, #cascade div, #conversation li, #chat li, #cascade li {\n' +
+            '    color: inherit !important;\n' +
+            '}\n' +
+            '\n' +
+            '#conversation a, #chat a, #cascade a {\n' +
+            '    color: #60a5fa !important;\n' +
+            '    text-decoration: underline;\n' +
+            '}\n' +
+            '\n' +
+            '/* Fix Inline Code - Ultra-compact */\n' +
+            ':not(pre) > code {\n' +
+            '    padding: 0px 2px !important;\n' +
+            '    border-radius: 2px !important;\n' +
+            '    background-color: rgba(255, 255, 255, 0.1) !important;\n' +
+            '    font-size: 0.82em !important;\n' +
+            '    line-height: 1 !important;\n' +
+            '    white-space: normal !important;\n' +
+            '}\n' +
+            '\n' +
+            'pre, code, .monaco-editor-background {' +
+            '    background-color: #1e293b !important;' +
+            '    color: #e2e8f0 !important;' +
+            '    font-family: \'JetBrains Mono\', monospace !important;' +
+            '    border-radius: 3px;' +
+            '    border: 1px solid #334155;' +
+            '}\n' +
+            '\n' +
+            '/* Terminal blocks - collapse empty ones, limit height */' +
+            '[class*="terminal"] {' +
+            '    background-color: #1e293b !important;' +
+            '    color: #e2e8f0 !important;' +
+            '    font-family: \'JetBrains Mono\', monospace !important;' +
+            '    border-radius: 3px;' +
+            '    border: 1px solid #334155;' +
+            '    max-height: 300px !important;' +
+            '    overflow: hidden !important;' +
+            '    height: auto !important;' +
+            '    min-height: 0 !important;' +
+            '}\n' +
+            '\n' +
+            '/* Hide truly empty terminal containers */' +
+            '[class*="terminal"]:empty,' +
+            '[class*="terminal"]:not(:has(*)),' +
+            '[class*="xterm"]:empty,' +
+            '[class*="xterm"]:not(:has(*)) {' +
+            '    display: none !important;' +
+            '}\n' +
+            '                \n' +
+            '/* Multi-line Code Block - Minimal */\n' +
+            'pre {\n' +
+            '    position: relative !important;\n' +
+            '    white-space: pre-wrap !important; \n' +
+            '    word-break: break-word !important;\n' +
+            '    padding: 4px 6px !important;\n' +
+            '    margin: 2px 0 !important;\n' +
+            '    display: block !important;\n' +
+            '    width: 100% !important;\n' +
+            '}\n' +
+            '                \n' +
+            'pre.has-copy-btn {\n' +
+            '    padding-right: 28px !important;\n' +
+            '}\n' +
+            '                \n' +
+            '/* Single-line Code Block - Minimal */\n' +
+            'pre.single-line-pre {\n' +
+            '    display: inline-block !important;\n' +
+            '    width: auto !important;\n' +
+            '    max-width: 100% !important;\n' +
+            '    padding: 0px 4px !important;\n' +
+            '    margin: 0px !important;\n' +
+            '    vertical-align: middle !important;\n' +
+            '    background-color: #1e293b !important;\n' +
+            '    font-size: 0.85em !important;\n' +
+            '}\n' +
+            '                \n' +
+            'pre.single-line-pre > code {\n' +
+            '    display: inline !important;\n' +
+            '    white-space: nowrap !important;\n' +
+            '}\n' +
+            '                \n' +
+            'pre:not(.single-line-pre) > code {\n' +
+            '    display: block !important;\n' +
+            '    width: 100% !important;\n' +
+            '    overflow-x: auto !important;\n' +
+            '    background: transparent !important;\n' +
+            '    border: none !important;\n' +
+            '    padding: 0 !important;\n' +
+            '    margin: 0 !important;\n' +
+            '}\n' +
+            '                \n' +
+            '.mobile-copy-btn {\n' +
+            '    position: absolute !important;\n' +
+            '    top: 2px !important;\n' +
+            '    right: 2px !important;\n' +
+            '    background: rgba(30, 41, 59, 0.5) !important; /* Transparent bg */\n' +
+            '    color: #94a3b8 !important;\n' +
+            '    border: none !important;\n' +
+            '    width: 24px !important; \n' +
+            '    height: 24px !important;\n' +
+            '    padding: 0 !important;\n' +
+            '    cursor: pointer !important;\n' +
+            '    display: flex !important;\n' +
+            '    align-items: center !important;\n' +
+            '    justify-content: center !important;\n' +
+            '    border-radius: 4px !important;\n' +
+            '    transition: all 0.2s ease !important;\n' +
+            '    -webkit-tap-highlight-color: transparent !important;\n' +
+            '    z-index: 10 !important;\n' +
+            '    margin: 0 !important;\n' +
+            '}\n' +
+            '                \n' +
+            '.mobile-copy-btn:hover,\n' +
+            '.mobile-copy-btn:focus {\n' +
+            '    background: rgba(59, 130, 246, 0.2) !important;\n' +
+            '    color: #60a5fa !important;\n' +
+            '}\n' +
+            '                \n' +
+            '.mobile-copy-btn svg {\n' +
+            '    width: 16px !important;\n' +
+            '    height: 16px !important;\n' +
+            '    stroke: currentColor !important;\n' +
+            '    stroke-width: 2 !important;\n' +
+            '    fill: none !important;\n' +
+            '}\n' +
+            '                \n' +
+            'blockquote {\n' +
+            '    border-left: 3px solid #3b82f6 !important;\n' +
+            '    background: rgba(59, 130, 246, 0.1) !important;\n' +
+            '    color: #cbd5e1 !important;\n' +
+            '    padding: 8px 12px !important;\n' +
+            '    margin: 8px 0 !important;\n' +
+            '}\n' +
+            '\n' +
+            'table {\n' +
+            '    border-collapse: collapse !important;\n' +
+            '    width: 100% !important;\n' +
+            '    border: 1px solid #334155 !important;\n' +
+            '}\n' +
+            'th, td {\n' +
+            '    border: 1px solid #334155 !important;\n' +
+            '    padding: 8px !important;\n' +
+            '    color: #e2e8f0 !important;\n' +
+            '}\n' +
+            '\n' +
+            '::-webkit-scrollbar {\n' +
+            '    width: 0 !important;\n' +
+            '}\n' +
+            '                \n' +
+            '[style*="background-color: rgb(255, 255, 255)"],\n' +
+            '[style*="background-color: white"],\n' +
+            '[style*="background: white"] {\n' +
+            '    background-color: transparent !important;\n' +
+            '}\n' +
+            '';
+        styleTag.textContent = darkModeOverrides;
+        chatContent.innerHTML = data.html;
+
+
+        // Add mobile copy buttons to all code blocks
+        addMobileCopyButtons();
+
+        // Action button enhancement removed — was too broad
+
+        // Smart scroll behavior: respect user scroll, only auto-scroll when appropriate
+        if (isUserScrollLocked) {
+            // User recently scrolled - try to maintain their approximate position
+            // Use percentage-based restoration for better accuracy
+            const scrollPercent = scrollHeight > 0 ? scrollPos / scrollHeight : 0;
+            const newScrollPos = chatContainer.scrollHeight * scrollPercent;
+            chatContainer.scrollTop = newScrollPos;
+        } else if (isNearBottom || scrollPos === 0) {
+            // User was at bottom or hasn't scrolled - auto scroll to bottom
+            scrollToBottom();
+        } else {
+            // Preserve exact scroll position
+            chatContainer.scrollTop = scrollPos;
+        }
+
+    } catch (err) {
+        console.error(err);
+    }
+}
+
+// --- Mobile Code Block Copy Functionality ---
+function addMobileCopyButtons() {
+    // Find all pre elements (code blocks) in the chat
+    const codeBlocks = chatContent.querySelectorAll('pre');
+
+    codeBlocks.forEach((pre, index) => {
+        // Skip if already has our button
+        if (pre.querySelector('.mobile-copy-btn')) return;
+
+        // Get the code text
+        const codeElement = pre.querySelector('code') || pre;
+        const textToCopy = (codeElement.textContent || codeElement.innerText).trim();
+
+        // Check if there's a newline character in the TRIMMED text
+        // This ensures single-line blocks with trailing newlines don't get buttons
+        const hasNewline = /\n/.test(textToCopy);
+
+        // If it's a single line code block, don't add the copy button
+        if (!hasNewline) {
+            pre.classList.remove('has-copy-btn');
+            pre.classList.add('single-line-pre');
+            return;
+        }
+
+        // Add class for padding
+        pre.classList.remove('single-line-pre');
+        pre.classList.add('has-copy-btn');
+
+        // Create the copy button (icon only)
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'mobile-copy-btn';
+        copyBtn.setAttribute('data-code-index', index);
+        copyBtn.setAttribute('aria-label', 'Copy code');
+        copyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+            `;
+
+        // Add click handler for copy
+        copyBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const success = await copyToClipboard(textToCopy);
+
+            if (success) {
+                // Visual feedback - show checkmark
+                copyBtn.classList.add('copied');
+                copyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+            `;
+
+                // Reset after 2 seconds
+                setTimeout(() => {
+                    copyBtn.classList.remove('copied');
+                    copyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+            `;
+                }, 2000);
+            } else {
+                // Show X icon briefly on error
+                copyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+            `;
+                setTimeout(() => {
+                    copyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+            `;
+                }, 2000);
+            }
+        });
+
+        // Insert button into pre element
+        pre.appendChild(copyBtn);
+    });
+}
+// enhanceActionButtons removed — was matching too many unrelated IDE buttons
+
+// --- Cross-platform Clipboard Copy ---
+async function copyToClipboard(text) {
+    // Method 1: Modern Clipboard API (works on HTTPS or localhost)
+    if (navigator.clipboard && window.isSecureContext) {
+        try {
+            await navigator.clipboard.writeText(text);
+            console.log('[COPY] Success via Clipboard API');
+            return true;
+        } catch (err) {
+            console.warn('[COPY] Clipboard API failed:', err);
+        }
+    }
+
+    // Method 2: Fallback using execCommand (works on HTTP, older browsers)
+    try {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+
+        // Avoid scrolling to bottom on iOS
+        textArea.style.position = 'fixed';
+        textArea.style.top = '0';
+        textArea.style.left = '0';
+        textArea.style.width = '2em';
+        textArea.style.height = '2em';
+        textArea.style.padding = '0';
+        textArea.style.border = 'none';
+        textArea.style.outline = 'none';
+        textArea.style.boxShadow = 'none';
+        textArea.style.background = 'transparent';
+        textArea.style.opacity = '0';
+
+        document.body.appendChild(textArea);
+
+        // iOS specific handling
+        if (navigator.userAgent.match(/ipad|iphone/i)) {
+            const range = document.createRange();
+            range.selectNodeContents(textArea);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            textArea.setSelectionRange(0, text.length);
+        } else {
+            textArea.select();
+        }
+
+        const success = document.execCommand('copy');
+        document.body.removeChild(textArea);
+
+        if (success) {
+            console.log('[COPY] Success via execCommand fallback');
+            return true;
+        }
+    } catch (err) {
+        console.warn('[COPY] execCommand fallback failed:', err);
+    }
+
+    // Method 3: For Android WebView or restricted contexts
+    // Show the text in a selectable modal if all else fails
+    console.error('[COPY] All copy methods failed');
+    return false;
+}
+
+function scrollToBottom() {
+    chatContainer.scrollTo({
+        top: chatContainer.scrollHeight,
+        behavior: 'smooth'
+    });
+}
+
+// --- Inputs ---
+async function sendMessage() {
+    const message = messageInput.value.trim();
+    if (!message && pendingFiles.length === 0) return;
+
+    // Optimistic UI updates
+    const previousValue = messageInput.value;
+    messageInput.value = ''; // Clear immediately
+    messageInput.style.height = 'auto'; // Reset height
+    messageInput.blur(); // Close keyboard on mobile immediately
+
+    sendBtn.disabled = true;
+    sendBtn.style.opacity = '0.5';
+
+    try {
+        // If no chat is open, start a new one first
+        if (!chatIsOpen) {
+            const newChatRes = await fetchWithAuth('/new-chat', { method: 'POST' });
+            const newChatData = await newChatRes.json();
+            if (newChatData.success) {
+                // Wait for the new chat to be ready
+                await new Promise(r => setTimeout(r, 800));
+                chatIsOpen = true;
+            }
+        }
+
+        // Upload attached images first
+        if (pendingFiles.length > 0) {
+            for (const pf of pendingFiles) {
+                try {
+                    await fetchWithAuth('/upload-image', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: pf.name, dataUrl: pf.dataUrl })
+                    });
+                } catch (uploadErr) {
+                    console.warn('Image upload error:', uploadErr);
+                }
+            }
+            pendingFiles = [];
+            renderAttachPreviews();
+        }
+
+        // Send text message if present
+        if (message) {
+            const sendController = new AbortController();
+            const sendTimeout = setTimeout(() => sendController.abort(), 15000); // 15s timeout
+            try {
+                const res = await fetchWithAuth('/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message }),
+                    signal: sendController.signal
+                });
+                clearTimeout(sendTimeout);
+
+                if (res.ok) {
+                    const data = await res.json();
+                    // Handle queued messages (agent is busy with terminal command)
+                    if (data.queued) {
+                        showToast(`📋 Message queued (#${data.queuePosition}) — agent is busy`, 4000);
+                    } else if (data.reason === 'queue_full') {
+                        showToast('⚠️ Queue full — agent is very busy, try again later', 4000);
+                        messageInput.value = message;
+                    } else if (data.reason === 'endpoint_timeout') {
+                        showToast('⏳ Server busy — message may still go through', 3000);
+                    }
+                } else if (res.status === 503) {
+                    showToast('⚠️ CDP disconnected — retrying...', 2000);
+                    // Retry once after 2s
+                    setTimeout(async () => {
+                        try {
+                            await fetchWithAuth('/send', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ message })
+                            });
+                            showToast('✅ Message sent on retry', 2000);
+                            setTimeout(loadSnapshot, 500);
+                        } catch (e) {
+                            showToast('❌ Retry failed — check connection', 3000);
+                            messageInput.value = message;
+                        }
+                    }, 2000);
+                } else {
+                    console.warn('Send response not ok:', await res.json().catch(() => ({})));
+                }
+            } catch (fetchErr) {
+                clearTimeout(sendTimeout);
+                if (fetchErr.name === 'AbortError') {
+                    showToast('⏳ Send timed out — server may be busy', 3000);
+                } else {
+                    throw fetchErr; // Re-throw for outer catch
+                }
+            }
+        }
+
+        // Burst snapshot fetches — show agent "running" state quickly
+        setTimeout(loadSnapshot, 300);
+        setTimeout(loadSnapshot, 800);
+        setTimeout(loadSnapshot, 2000);
+        setTimeout(loadSnapshot, 4000);
+        setTimeout(loadSnapshot, 7000);
+        setTimeout(checkChatStatus, 1000);
+    } catch (e) {
+        // Network error - still try to refresh in case it went through
+        console.error('Send error:', e);
+        showToast('⚠️ Network error — retrying...', 2000);
+        // Retry once on network error
+        setTimeout(async () => {
+            try {
+                await fetchWithAuth('/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+                showToast('✅ Message sent on retry', 2000);
+            } catch (e2) {
+                messageInput.value = message;
+                showToast('❌ Send failed — message restored', 3000);
+            }
+        }, 2000);
+        setTimeout(loadSnapshot, 500);
+    } finally {
+        sendBtn.disabled = false;
+        sendBtn.style.opacity = '1';
+    }
+}
+
+// --- Event Listeners ---
+
+// Image attach handling
+const attachBtn = document.getElementById('attachBtn');
+const fileInput = document.getElementById('fileInput');
+const attachPreview = document.getElementById('attachPreview');
+const attachPreviewInner = document.getElementById('attachPreviewInner');
+let pendingFiles = [];
+
+attachBtn.addEventListener('click', () => {
+    fileInput.click();
+});
+
+fileInput.addEventListener('change', (e) => {
+    const files = Array.from(e.target.files);
+    files.forEach(file => {
+        if (!file.type.startsWith('image/')) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            pendingFiles.push({ name: file.name, dataUrl: ev.target.result, file });
+            renderAttachPreviews();
+        };
+        reader.readAsDataURL(file);
+    });
+    fileInput.value = ''; // Reset so same file can be selected again
+});
+
+function renderAttachPreviews() {
+    if (pendingFiles.length === 0) {
+        attachPreview.style.display = 'none';
+        return;
+    }
+    attachPreview.style.display = 'block';
+    attachPreviewInner.innerHTML = '';
+    pendingFiles.forEach((f, idx) => {
+        const thumb = document.createElement('div');
+        thumb.className = 'attach-thumb';
+        thumb.innerHTML = `<img src="${f.dataUrl}" alt="${f.name}"/><button class="attach-thumb-remove" data-idx="${idx}">×</button>`;
+        thumb.querySelector('.attach-thumb-remove').addEventListener('click', (e) => {
+            e.stopPropagation();
+            pendingFiles.splice(idx, 1);
+            renderAttachPreviews();
+        });
+        attachPreviewInner.appendChild(thumb);
+    });
+}
+
+sendBtn.addEventListener('click', sendMessage);
+
+refreshBtn.addEventListener('click', async () => {
+    // Restart IDE: Kill antigravity and relaunch with --remote-debugging-port=9222
+    if (!confirm('Restart IDE?\n\nThis will shut down Antigravity and relaunch it with debug port 9222.')) return;
+
+    refreshBtn.textContent = '⏳ Restarting...';
+    refreshBtn.disabled = true;
+    refreshBtn.style.opacity = '0.5';
+
+    try {
+        const res = await fetchWithAuth('/restart-ide', { method: 'POST' });
+        const data = await res.json();
+
+        if (data.success) {
+            // Show countdown while IDE restarts
+            let countdown = 15;
+            chatContent.innerHTML = `
+                <div class="empty-state">
+                    <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M23 4v6h-6M1 20v-6h6"></path>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                    <h2>IDE Restarting...</h2>
+                    <p>antigravity --remote-debugging-port=9222</p>
+                    <p id="restartCountdown" style="font-size: 24px; font-weight: 600; color: #22c55e;">⏳ ${countdown}s</p>
+                </div>
+            `;
+
+            const countdownEl = document.getElementById('restartCountdown');
+            const timer = setInterval(() => {
+                countdown--;
+                if (countdownEl) countdownEl.textContent = `⏳ ${countdown}s`;
+                if (countdown <= 0) {
+                    clearInterval(timer);
+                    // Try to reconnect
+                    refreshBtn.textContent = '↻ Restart IDE';
+                    refreshBtn.disabled = false;
+                    refreshBtn.style.opacity = '1';
+                    loadSnapshot();
+                    fetchAppState();
+                }
+            }, 1000);
+        } else {
+            alert('Restart failed: ' + (data.error || 'Unknown error'));
+            refreshBtn.textContent = '↻ Restart IDE';
+            refreshBtn.disabled = false;
+            refreshBtn.style.opacity = '1';
+        }
+    } catch (e) {
+        console.error('Restart IDE error:', e);
+        alert('Failed to restart IDE: ' + e.message);
+        refreshBtn.textContent = '↻ Restart IDE';
+        refreshBtn.disabled = false;
+        refreshBtn.style.opacity = '1';
+    }
+});
+
+messageInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+messageInput.addEventListener('input', function () {
+    this.style.height = 'auto';
+    this.style.height = (this.scrollHeight) + 'px';
+});
+
+// --- Scroll Sync to Desktop ---
+let scrollSyncTimeout = null;
+let lastScrollSync = 0;
+const SCROLL_SYNC_DEBOUNCE = 150; // ms between scroll syncs
+let snapshotReloadPending = false;
+
+async function syncScrollToDesktop() {
+    const scrollPercent = chatContainer.scrollTop / (chatContainer.scrollHeight - chatContainer.clientHeight);
+    try {
+        await fetchWithAuth('/remote-scroll', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scrollPercent })
+        });
+
+        // After scrolling desktop, reload snapshot to get newly visible content
+        // (Antigravity uses virtualized scrolling - only visible messages are in DOM)
+        if (!snapshotReloadPending) {
+            snapshotReloadPending = true;
+            setTimeout(() => {
+                loadSnapshot();
+                snapshotReloadPending = false;
+            }, 300);
+        }
+    } catch (e) {
+        console.log('Scroll sync failed:', e.message);
+    }
+}
+
+chatContainer.addEventListener('scroll', () => {
+    userIsScrolling = true;
+    // Set a lock to prevent auto-scroll jumping for a few seconds
+    userScrollLockUntil = Date.now() + USER_SCROLL_LOCK_DURATION;
+    clearTimeout(idleTimer);
+
+    const isNearBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight < 120;
+    if (isNearBottom) {
+        scrollToBottomBtn.classList.remove('show');
+        // If user scrolled to bottom, clear the lock so auto-scroll works
+        userScrollLockUntil = 0;
+    } else {
+        scrollToBottomBtn.classList.add('show');
+    }
+
+    // Debounced scroll sync to desktop
+    const now = Date.now();
+    if (now - lastScrollSync > SCROLL_SYNC_DEBOUNCE) {
+        lastScrollSync = now;
+        clearTimeout(scrollSyncTimeout);
+        scrollSyncTimeout = setTimeout(syncScrollToDesktop, 100);
+    }
+
+    idleTimer = setTimeout(() => {
+        userIsScrolling = false;
+        autoRefreshEnabled = true;
+    }, 5000);
+});
+
+scrollToBottomBtn.addEventListener('click', () => {
+    userIsScrolling = false;
+    userScrollLockUntil = 0; // Clear lock so auto-scroll works again
+    scrollToBottom();
+});
+
+// --- Quick Actions ---
+function quickAction(text) {
+    messageInput.value = text;
+    messageInput.style.height = 'auto';
+    messageInput.style.height = messageInput.scrollHeight + 'px';
+    messageInput.focus();
+}
+
+// --- Stop Logic ---
+stopBtn.addEventListener('click', async () => {
+    stopBtn.style.opacity = '0.5';
+    try {
+        const res = await fetchWithAuth('/stop', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+            // alert('Stopped');
+        } else {
+            // alert('Error: ' + data.error);
+        }
+    } catch (e) { }
+    setTimeout(() => stopBtn.style.opacity = '1', 500);
+});
+
+// --- New Chat Logic ---
+async function startNewChat() {
+    newChatBtn.style.opacity = '0.5';
+    newChatBtn.style.pointerEvents = 'none';
+
+    try {
+        const res = await fetchWithAuth('/new-chat', { method: 'POST' });
+        const data = await res.json();
+
+        if (data.success) {
+            // Reload snapshot to show new empty chat
+            setTimeout(loadSnapshot, 500);
+            setTimeout(loadSnapshot, 1000);
+            setTimeout(checkChatStatus, 1500);
+        } else {
+            console.error('Failed to start new chat:', data.error);
+        }
+    } catch (e) {
+        console.error('New chat error:', e);
+    }
+
+    setTimeout(() => {
+        newChatBtn.style.opacity = '1';
+        newChatBtn.style.pointerEvents = 'auto';
+    }, 500);
+}
+
+newChatBtn.addEventListener('click', startNewChat);
+
+// --- Chat History Logic ---
+async function showChatHistory() {
+    const historyLayer = document.getElementById('historyLayer');
+    const historyList = document.getElementById('historyList');
+
+    // Show loading state
+    historyList.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: var(--text-muted);"><div class="loading-spinner" style="margin: 0 auto 12px;"></div><p>Loading conversations...</p></div>`;
+    historyLayer.classList.add('show');
+
+    try {
+        const res = await fetchWithAuth('/chat-history');
+        const data = await res.json();
+
+        if (data.error || !data.chats || data.chats.length === 0) {
+            historyList.innerHTML = `
+                <div style="padding: 40px 20px; text-align: center; color: var(--text-muted);">
+                    <div style="font-size: 24px; margin-bottom: 10px;">💬</div>
+                    <div style="font-weight: 500; margin-bottom: 5px;">No conversations found</div>
+                    <div style="font-size: 13px; opacity: 0.7;">${data.error || 'Start a new chat to get going!'}</div>
+                    <br>
+                    <div class="history-item new-chat-item" onclick="hideChatHistory(); startNewChat();" style="justify-content: center; background: var(--accent); color: white; border:none; border-radius: 8px; margin-top: 10px;">
+                        Start New Conversation
+                    </div>
+                </div>
+            `;
+            return;
+        }
+
+        let html = `
+            <div class="history-item new-chat-item" onclick="hideChatHistory(); startNewChat();" style="justify-content: center; background: rgba(34, 197, 94, 0.2); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.3); border-radius: 8px; margin: 8px 16px;">
+                ＋ New Conversation
+            </div>
+        `;
+
+        data.chats.forEach(chat => {
+            const title = chat.title || chat.name || 'Untitled';
+            const escapedTitle = title.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            html += `
+                <div class="history-item" onclick="hideChatHistory(); selectChat('${escapedTitle}');">
+                    <div class="history-item-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+                    <div class="history-item-text">
+                        <div class="history-item-title">${title}</div>
+                    </div>
+                </div>
+            `;
+        });
+
+        historyList.innerHTML = html;
+    } catch (e) {
+        console.error('History fetch error:', e);
+        historyList.innerHTML = `
+            <div style="padding: 40px 20px; text-align: center; color: var(--text-muted);">
+                <div style="font-size: 24px; margin-bottom: 10px;">⚠️</div>
+                <div style="font-weight: 500;">Connection Error</div>
+                <div style="font-size: 13px; opacity: 0.7; margin-top: 5px;">Could not load history: ${e.message}</div>
+            </div>
+        `;
+    }
+    setTimeout(() => historyBtn.style.opacity = '1', 300);
+}
+
+function hideChatHistory() {
+    historyLayer.classList.remove('show');
+}
+
+historyBtn.addEventListener('click', showChatHistory);
+
+// --- Select Chat from History ---
+async function selectChat(title) {
+    try {
+        const res = await fetchWithAuth('/select-chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            setTimeout(loadSnapshot, 300);
+            setTimeout(loadSnapshot, 800);
+            setTimeout(checkChatStatus, 1000);
+        } else {
+            console.error('Failed to select chat:', data.error);
+        }
+    } catch (e) {
+        console.error('Select chat error:', e);
+    }
+}
+
+// --- Check Chat Status ---
+async function checkChatStatus() {
+    try {
+        const res = await fetchWithAuth('/chat-status');
+        const data = await res.json();
+
+        chatIsOpen = data.hasChat || data.editorFound;
+
+        if (!chatIsOpen) {
+            showEmptyState();
+        }
+    } catch (e) {
+        console.error('Chat status check failed:', e);
+    }
+}
+
+// --- Empty State (No Chat Open) ---
+function showEmptyState() {
+    chatContent.innerHTML = `
+        <div class="empty-state">
+            <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                <line x1="9" y1="10" x2="15" y2="10"></line>
+            </svg>
+            <h2>No Chat Open</h2>
+            <p>Start a new conversation or select one from your history to begin chatting.</p>
+            <button class="empty-state-btn" onclick="startNewChat()">
+                Start New Conversation
+            </button>
+        </div>
+    `;
+}
+
+// --- Utility: Escape HTML ---
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// --- Settings Logic ---
+
+
+function openModal(title, options, onSelect) {
+    modalTitle.textContent = title;
+    modalList.innerHTML = '';
+    options.forEach(opt => {
+        const div = document.createElement('div');
+        div.className = 'modal-option';
+        div.textContent = opt;
+        div.onclick = () => {
+            onSelect(opt);
+            closeModal();
+        };
+        modalList.appendChild(div);
+    });
+    modalOverlay.classList.add('show');
+}
+
+function closeModal() {
+    modalOverlay.classList.remove('show');
+}
+
+modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+};
+
+modeBtn.addEventListener('click', () => {
+    openModal('Select Mode', ['Fast', 'Planning'], async (mode) => {
+        modeText.textContent = 'Setting...';
+        try {
+            const res = await fetchWithAuth('/set-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mode })
+            });
+            const data = await res.json();
+            if (data.success) {
+                currentMode = mode;
+                modeText.textContent = mode;
+                modeBtn.classList.toggle('active', mode === 'Planning');
+            } else {
+                alert('Error: ' + (data.error || 'Unknown'));
+                modeText.textContent = currentMode;
+            }
+        } catch (e) {
+            modeText.textContent = currentMode;
+        }
+    });
+});
+
+modelBtn.addEventListener('click', () => {
+    openModal('Select Model', MODELS, async (model) => {
+        const prev = modelText.textContent;
+        modelText.textContent = 'Setting...';
+        try {
+            const res = await fetchWithAuth('/set-model', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model })
+            });
+            const data = await res.json();
+            if (data.success) {
+                modelText.textContent = model;
+            } else {
+                alert('Error: ' + (data.error || 'Unknown'));
+                modelText.textContent = prev;
+            }
+        } catch (e) {
+            modelText.textContent = prev;
+        }
+    });
+});
+
+// --- Viewport / Keyboard Handling ---
+// This fixes the issue where the keyboard hides the input or layout breaks
+if (window.visualViewport) {
+    function handleResize() {
+        // Resize the body to match the visual viewport (screen minus keyboard)
+        document.body.style.height = window.visualViewport.height + 'px';
+
+        // Scroll to bottom if keyboard opened
+        if (document.activeElement === messageInput) {
+            setTimeout(scrollToBottom, 100);
+        }
+    }
+
+    window.visualViewport.addEventListener('resize', handleResize);
+    window.visualViewport.addEventListener('scroll', handleResize);
+    handleResize(); // Init
+} else {
+    // Fallback for older browsers without visualViewport support
+    window.addEventListener('resize', () => {
+        document.body.style.height = window.innerHeight + 'px';
+    });
+    document.body.style.height = window.innerHeight + 'px'; // Init
+}
+
+// --- Remote Click Logic (Thinking/Thought + Action Buttons) ---
+chatContainer.addEventListener('click', async (e) => {
+    const target = e.target.closest('div, span, p, summary, button, details');
+    if (!target) return;
+
+    const text = (target.innerText || '').trim();
+
+    // === ACTION BUTTON DETECTION ===
+    // Check if clicked element is an action/approval button (Run, Accept, Allow, Approve, etc.)
+    const actionBtn = e.target.closest('button, [role="button"]');
+    if (actionBtn) {
+        const btnText = (actionBtn.innerText || actionBtn.textContent || '').trim();
+        const isActionButton = /^(Run|Accept|Allow|Approve|Yes|OK|Confirm|Save|Apply|Execute|Continue|Proceed)$/i.test(btnText) ||
+            /^(Run Command|Run command|Accept All|Allow All|Accept Changes|Approve All)$/i.test(btnText) ||
+            actionBtn.classList.contains('gr-action-btn') ||
+            actionBtn.getAttribute('data-testid')?.match(/(approve|accept|run|allow)/i);
+
+        if (isActionButton) {
+            console.log('[ACTION] Approval button clicked:', btnText);
+            // Visual feedback
+            actionBtn.style.opacity = '0.5';
+            actionBtn.style.transform = 'scale(0.95)';
+            setTimeout(() => {
+                actionBtn.style.opacity = '1';
+                actionBtn.style.transform = '';
+            }, 400);
+
+            try {
+                const response = await fetchWithAuth('/approve-action', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ buttonText: btnText })
+                });
+                const data = await response.json();
+                console.log('[ACTION] Approve result:', data);
+
+                // Reload snapshot to see updated state
+                setTimeout(loadSnapshot, 500);
+                setTimeout(loadSnapshot, 1200);
+                setTimeout(loadSnapshot, 2500);
+            } catch (err) {
+                console.error('[ACTION] Approve failed:', err);
+            }
+            return; // Don't fall through to thought toggle logic
+        }
+    }
+
+    // === THOUGHT TOGGLE DETECTION ===
+    const isThoughtToggle = /Thought|Thinking/i.test(text) && text.length < 500;
+    if (isThoughtToggle) {
+        target.style.opacity = '0.5';
+        setTimeout(() => target.style.opacity = '1', 300);
+
+        const firstLine = text.split('\n')[0].trim();
+        try {
+            const response = await fetchWithAuth('/remote-click', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    selector: target.tagName.toLowerCase(),
+                    index: 0,
+                    textContent: firstLine
+                })
+            });
+            setTimeout(loadSnapshot, 400);
+            setTimeout(loadSnapshot, 800);
+            setTimeout(loadSnapshot, 1500);
+        } catch (e) {
+            console.error('Remote click failed:', e);
+        }
+    }
+});
+
+// --- Init ---
+connectWebSocket();
+// Sync state initially and every 5 seconds to keep phone in sync with desktop changes
+fetchAppState();
+setInterval(fetchAppState, 5000);
+
+// Check chat status initially and periodically
+checkChatStatus();
+setInterval(checkChatStatus, 10000); // Check every 10 seconds

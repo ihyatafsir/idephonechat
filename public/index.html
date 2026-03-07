@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Antigravity Phone Connect</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <!-- GravityRemote Header -->
+    <header class="header gr-header">
+        <div class="gr-brand" onclick="toggleHeaderCollapse()">◆ GRAVITYREMOTE</div>
+        <div class="header-controls">
+            <div class="gr-stat-compact">
+                <span class="gr-stat-label">CPU</span>
+                <span class="gr-stat-val" id="cpuStat">--%</span>
+            </div>
+            <div class="gr-stat-compact">
+                <span class="gr-stat-label">RAM</span>
+                <span class="gr-stat-val" id="ramStat">--MB</span>
+            </div>
+            <span class="gr-agent-badge">Agent</span>
+            <div class="status-badge">
+                <div class="status-dot disconnected" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Control Panel -->
+    <div class="gr-control-panel" id="controlPanel">
+        <div class="gr-btn-group">
+            <button class="new-chat-btn" id="newChatBtn" aria-label="New Chat" title="New Chat">+ Chat</button>
+            <button class="stop-btn" id="stopBtn" aria-label="STOP">■ STOP</button>
+            <button class="history-btn" id="historyBtn" aria-label="Chat History" title="Past Conversations">📚
+                History</button>
+        </div>
+        <button class="refresh-btn" id="refreshBtn" aria-label="Restart IDE">↻ Restart IDE</button>
+    </div>
+
+    <!-- Settings Bar -->
+    <div class="settings-bar">
+        <div class="setting-chip" id="modeBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+            </svg>
+            <span id="modeText">Fast</span>
+        </div>
+        <div class="setting-chip" id="modelBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 16v-4" />
+                <path d="M12 8h.01" />
+            </svg>
+            <span id="modelText">Select Model</span>
+        </div>
+        <div class="setting-chip" id="syncStats" style="cursor: default; border: none; background: transparent;">
+            <span id="statsText" style="font-size: 10px; opacity: 0.6;">Syncing...</span>
+        </div>
+    </div>
+
+    <!-- Lisan al-Arab Scrolling Text -->
+    <div class="lisan-banners" id="lisanBanners">
+        <div id="lisan-marquee" class="lisan-marquee-container">
+        </div>
+    </div>
+
+    <!-- SSL Banner (shown when running HTTP) -->
+    <div class="ssl-banner" id="sslBanner" style="display: none;">
+        <span>⚠️ Not Secure - Running on HTTP</span>
+        <button id="enableHttpsBtn" onclick="enableHttps()">Enable HTTPS</button>
+        <button class="dismiss-btn" onclick="dismissSslBanner()">×</button>
+    </div>
+
+    <!-- Chat Container -->
+    <div class="chat-container" id="chatContainer">
+        <div class="chat-content" id="chatContent">
+            <div class="loading-state">
+                <div class="loading-spinner"></div>
+                <p>Waiting for snapshot...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scroll to Bottom FAB -->
+    <button class="fab" id="scrollToBottom" aria-label="Scroll to bottom">
+        <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 5v14M19 12l-7 7-7-7" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+    </button>
+
+    <!-- Quick Actions -->
+    <div class="quick-actions">
+        <div class="action-chip" onclick="quickAction('Continue')">Continue</div>
+        <div class="action-chip" onclick="quickAction('Please fix the bugs in this file.')">Fix Bugs</div>
+        <div class="action-chip" onclick="quickAction('Please create documentation for this.')">Create Docs</div>
+    </div>
+
+    <!-- Input Section -->
+    <div class="input-section">
+        <!-- Image Preview Strip -->
+        <div class="attach-preview" id="attachPreview" style="display: none;">
+            <div class="attach-preview-inner" id="attachPreviewInner"></div>
+        </div>
+        <div class="input-wrapper">
+            <input type="file" id="fileInput" accept="image/*" multiple style="display: none;" />
+            <button class="attach-btn" id="attachBtn" aria-label="Attach image" title="Attach image">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <polyline points="21 15 16 10 5 21" />
+                </svg>
+            </button>
+            <textarea id="messageInput" placeholder="Message..." rows="1"></textarea>
+            <button class="send-btn" id="sendBtn" aria-label="Send">
+                <svg viewBox="0 0 24 24">
+                    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"
+                        style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal-panel" id="modalPanel">
+            <div class="modal-title" id="modalTitle">Select Option</div>
+            <div id="modalList"></div>
+            <div style="margin-top:20px; text-align:center;">
+                <button onclick="closeModal()"
+                    style="background:transparent; border:none; color:var(--text-muted); padding:10px;">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- History Layer (Full Screen) -->
+    <div class="history-layer" id="historyLayer">
+        <div class="history-header">
+            <button class="icon-btn" onclick="hideChatHistory()" aria-label="Back">
+                <svg viewBox="0 0 24 24" width="24" height="24">
+                    <path d="M19 12H5M12 19l-7-7 7-7" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round" />
+                </svg>
+            </button>
+            <h2>Conversations</h2>
+            <div style="width: 24px;"></div> <!-- Spacer -->
+        </div>
+        <div class="history-content" id="historyList">
+            <!-- Items injected here -->
+        </div>
+    </div>
+
+    <script>
+        // ◆ GRAVITYREMOTE Header Functions
+        let grHeaderCollapsed = false;
+        function toggleHeaderCollapse() {
+            grHeaderCollapsed = !grHeaderCollapsed;
+            const els = ['controlPanel', 'lisanBanners', 'settingsBar', 'quickActions'];
+            els.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('gr-collapsed', grHeaderCollapsed);
+            });
+            // Also toggle the settings bar by class if no ID
+            document.querySelectorAll('.settings-bar, .quick-actions').forEach(el => {
+                el.classList.toggle('gr-collapsed', grHeaderCollapsed);
+            });
+        }
+
+        // System stats polling (real CPU/RAM from server)
+        async function pollSystemStats() {
+            try {
+                const res = await fetch('/health');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.cpu !== undefined) {
+                        document.getElementById('cpuStat').textContent = data.cpu + '%';
+                    }
+                    if (data.ram) {
+                        document.getElementById('ramStat').textContent = data.ram.usedGB + '/' + data.ram.totalGB + 'G';
+                    }
+                }
+            } catch (e) {
+                document.getElementById('cpuStat').textContent = 'ERR';
+                document.getElementById('ramStat').textContent = 'ERR';
+            }
+        }
+        pollSystemStats();
+        setInterval(pollSystemStats, 5000);
+
+        // ==========================================
+        // لِسَان العَرَب - Lisan al-Arab Streaming
+        // ==========================================
+
+        let lisanSentences = [
+            "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+            "اقْرَأْ بِاسْمِ رَبِّكَ الَّذِي خَلَقَ",
+            "خَلَقَ الْإِنسَانَ مِنْ عَلَقٍ",
+            "اقْرَأْ وَرَبُّكَ الْأَكْرَمُ",
+            "الَّذِي عَلَّمَ بِالْقَلَمِ",
+            "عَلَّمَ الْإِنسَانَ مَا لَمْ يَعْلَمْ"
+        ];
+
+        // Fetch Lisan data from server (lisanclean.json roots)
+        async function fetchLisanData() {
+            try {
+                const response = await fetch('/api/lisan');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data && data.length > 0) {
+                        lisanSentences = data;
+                        currentLisanIndex = 0;
+                        console.log('Lisan data loaded:', data.length, 'sentences');
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to fetch Lisan data:', e);
+            }
+        }
+        fetchLisanData();
+        setInterval(fetchLisanData, 60000);
+
+        const consonantMap = {
+            'ا': 'ā', 'أ': 'a', 'إ': 'i', 'آ': 'ā',
+            'ب': 'b', 'ت': 't', 'ث': 'th',
+            'ج': 'j', 'ح': 'ḥ', 'خ': 'kh',
+            'د': 'd', 'ذ': 'dh',
+            'ر': 'r', 'ز': 'z',
+            'س': 's', 'ش': 'sh',
+            'ص': 'ṣ', 'ض': 'ḍ',
+            'ط': 'ṭ', 'ظ': 'ẓ',
+            'ع': 'ʿ', 'غ': 'gh',
+            'ف': 'f', 'ق': 'q',
+            'ك': 'k', 'ل': 'l',
+            'م': 'm', 'ن': 'n',
+            'ه': 'h', 'و': 'w',
+            'ي': 'y', 'ى': 'ā',
+            'ء': 'ʾ', 'ة': 'h',
+            'ـ': '',
+        };
+
+        const diacriticMap = {
+            'َ': 'a', 'ِ': 'i', 'ُ': 'u',
+            'ً': 'an', 'ٍ': 'in', 'ٌ': 'un',
+            'ْ': '', 'ّ': '',
+        };
+
+        function isDiacritic(char) {
+            return 'ًٌٍَُِّْ'.includes(char);
+        }
+
+        function transliterateWord(word) {
+            let result = '';
+            const chars = [...word];
+            for (let i = 0; i < chars.length; i++) {
+                const char = chars[i];
+                if (isDiacritic(char)) continue;
+                if (',.،؟:;'.includes(char)) { result += char; continue; }
+                let latin = consonantMap[char];
+                if (latin === undefined) { result += char; continue; }
+                let j = i + 1;
+                while (j < chars.length && isDiacritic(chars[j])) {
+                    const diac = chars[j];
+                    if (diac === 'ّ') { latin = latin + latin; }
+                    else if (diacriticMap[diac]) { latin = latin + diacriticMap[diac]; }
+                    j++;
+                }
+                result += latin;
+            }
+            return [...result].reverse().join('');
+        }
+
+        let currentLisanIndex = 0;
+
+        function createWordBlock(arabic, latin) {
+            const block = document.createElement('div');
+            block.className = 'word-block';
+            block.dataset.type = 'word';
+            const arSpan = document.createElement('div');
+            arSpan.className = 'word-arabic';
+            arSpan.textContent = arabic;
+            const laSpan = document.createElement('div');
+            laSpan.className = 'word-latin';
+            laSpan.textContent = latin;
+            block.appendChild(arSpan);
+            block.appendChild(laSpan);
+            return block;
+        }
+
+        function createSeparator() {
+            const sep = document.createElement('div');
+            sep.className = 'lisan-separator';
+            sep.dataset.type = 'separator';
+            sep.textContent = '◆';
+            return sep;
+        }
+
+        const marqueeContainer = document.getElementById('lisan-marquee');
+        if (marqueeContainer) marqueeContainer.style.direction = 'ltr';
+
+        let currentScroll = 0;
+        const SCROLL_SPEED = 32;
+        let lastTime = performance.now();
+        let isLisanInitialized = false;
+
+        function createSentenceFragment(sentence) {
+            const words = sentence.split(' ').reverse();
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(createSeparator());
+            words.forEach(word => {
+                if (!word.trim()) return;
+                const latin = transliterateWord(word);
+                fragment.appendChild(createWordBlock(word, latin));
+            });
+            return fragment;
+        }
+
+        function prependNextSentence() {
+            if (!lisanSentences.length) return;
+            const sentence = lisanSentences[currentLisanIndex];
+            const fragment = createSentenceFragment(sentence);
+            const oldWidth = marqueeContainer.getBoundingClientRect().width;
+            const firstChild = marqueeContainer.firstChild;
+            if (firstChild) { marqueeContainer.insertBefore(fragment, firstChild); }
+            else { marqueeContainer.appendChild(fragment); }
+            const newWidth = marqueeContainer.getBoundingClientRect().width;
+            currentScroll -= (newWidth - oldWidth);
+            currentLisanIndex = (currentLisanIndex + 1) % lisanSentences.length;
+        }
+
+        function animateStream(currentTime) {
+            if (!marqueeContainer) return;
+            const deltaTime = (currentTime - lastTime) / 1000;
+            const dt = Math.min(deltaTime, 0.1);
+            lastTime = currentTime;
+            currentScroll += SCROLL_SPEED * dt;
+            if (currentScroll > -200) { prependNextSentence(); }
+            const viewportWidth = marqueeContainer.parentElement.offsetWidth;
+            const lastChild = marqueeContainer.lastElementChild;
+            if (lastChild) {
+                const visualLeft = lastChild.offsetLeft + currentScroll;
+                if (visualLeft > viewportWidth) { marqueeContainer.removeChild(lastChild); }
+            }
+            marqueeContainer.style.transform = `translate3d(${currentScroll}px, 0, 0)`;
+            requestAnimationFrame(animateStream);
+        }
+
+        function initLisanStream() {
+            if (isLisanInitialized) return;
+            isLisanInitialized = true;
+            while (marqueeContainer.getBoundingClientRect().width < window.innerWidth * 2) {
+                prependNextSentence();
+            }
+            const width = marqueeContainer.getBoundingClientRect().width;
+            currentScroll = -width + window.innerWidth;
+            requestAnimationFrame(animateStream);
+        }
+
+        if (lisanSentences.length > 0) { initLisanStream(); }
+    </script>
+    <script src="js/app.js?v=2.0"></script>
+</body>
+
+</html>
