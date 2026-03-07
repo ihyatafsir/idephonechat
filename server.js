@@ -499,31 +499,51 @@ async function captureSnapshot(cdp) {
             scrollPercent: scrollContainer.scrollTop / (scrollContainer.scrollHeight - scrollContainer.clientHeight) || 0
         };
         
-        // --- Trim old messages to save phone RAM ---
-        // Keep only the last ~50 message blocks (inside the actual scroll container)
-        const scrollContainerClone = clone.querySelector('.overflow-y-auto, [data-scroll-area]') || clone;
-        const msgContainer = scrollContainerClone.firstElementChild ? scrollContainerClone : scrollContainerClone;
-        
+        // --- PERFORMANCE FIX: Avoid cloneNode(true) on massive trees ---
+        const msgContainer = scrollContainer.firstElementChild ? scrollContainer : scrollContainer;
+        const liveChildren = Array.from(msgContainer.children);
         const MAX_CHILDREN = 50;
-        const children = Array.from(msgContainer.children);
-        if (children.length > MAX_CHILDREN) {
-            const toRemove = children.length - MAX_CHILDREN;
-            for (let i = 0; i < toRemove; i++) {
-                msgContainer.removeChild(children[i]);
+        
+        // 1. Shallow clone the layout shell down to the message container
+        const clone = cascade.cloneNode(false);
+        let currentCloneParent = clone;
+        
+        // If scrollContainer is nested inside cascade, build the wrapper path
+        if (scrollContainer !== cascade) {
+            let path = [];
+            let curr = scrollContainer;
+            while (curr !== cascade && curr) {
+                path.push(curr);
+                curr = curr.parentElement;
             }
-            // Add a small indicator that older messages were trimmed
-            const trimNote = document.createElement('div');
-            trimNote.style.cssText = 'text-align:center;padding:8px;color:#666;font-size:12px;border-bottom:1px solid #333;margin-bottom:8px;';
-            trimNote.textContent = '⬆ ' + toRemove + ' earlier messages not shown (scroll on desktop to see)';
-            msgContainer.insertBefore(trimNote, msgContainer.firstChild);
+            path.reverse().forEach(el => {
+                const shallow = el.cloneNode(false);
+                currentCloneParent.appendChild(shallow);
+                currentCloneParent = shallow;
+            });
         }
         
+        // 2. Clone ONLY the last 50 message elements into our virtual shell
+        if (liveChildren.length > MAX_CHILDREN) {
+            const trimmedCount = liveChildren.length - MAX_CHILDREN;
+            const trimNote = document.createElement('div');
+            trimNote.style.cssText = 'text-align:center;padding:8px;color:#666;font-size:12px;border-bottom:1px solid #333;margin-bottom:8px;';
+            trimNote.textContent = '⬆ ' + trimmedCount + ' earlier messages not shown (scroll on desktop to see)';
+            currentCloneParent.appendChild(trimNote);
+            
+            const toKeep = liveChildren.slice(trimmedCount);
+            toKeep.forEach(el => currentCloneParent.appendChild(el.cloneNode(true)));
+        } else {
+            liveChildren.forEach(el => currentCloneParent.appendChild(el.cloneNode(true)));
+        }
+        
+        // 3. Apply cleanup rules (remove inputs, context blocks, etc)
         try {
             const interactionSelectors = [
                 '.relative.flex.flex-col.gap-8',
                 '.flex.grow.flex-col.justify-start.gap-8',
                 'div[class*="interaction-area"]',
-                '.p-1.bg-gray-500\\/10',
+                '.p-1.bg-gray-500\\\\/10',
                 '.outline-solid.justify-between',
                 '[contenteditable="true"]'
             ];
