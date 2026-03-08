@@ -135,12 +135,12 @@ function dismissSslBanner() {
 checkSslStatus();
 // --- Models ---
 const MODELS = [
-    "Gemini 3 Pro (High)",
-    "Gemini 3 Pro (Low)",
-    "Gemini 3 Flash ⚡",
-    "Claude Sonnet 4.5",
-    "Claude Sonnet 4.5 (Thinking)",
-    "Claude Opus 4.5 (Thinking) 💎",
+    "Gemini 3.1 Pro (High)",
+    "Gemini 3.1 Pro (Low)",
+    "Gemini 3.1 Flash ⚡",
+    "Claude Sonnet 4.6",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking) 💎",
     "GPT-OSS 120B (Medium)"
 ];
 
@@ -1206,10 +1206,10 @@ chatContainer.addEventListener('click', async (e) => {
     const actionBtn = e.target.closest('button, [role="button"]');
     if (actionBtn) {
         const btnText = (actionBtn.innerText || actionBtn.textContent || '').trim();
-        const isActionButton = /^(Run|Accept|Allow|Approve|Yes|OK|Confirm|Save|Apply|Execute|Continue|Proceed)$/i.test(btnText) ||
-            /^(Run Command|Run command|Accept All|Allow All|Accept Changes|Approve All)$/i.test(btnText) ||
+        const isActionButton = /^(Run|Accept|Allow|Approve|Yes|OK|Confirm|Save|Apply|Execute|Continue|Proceed|Deny|Reject|Cancel)$/i.test(btnText) ||
+            /^(Run Command|Run command|Accept All|Allow All|Allow Once|Allow This Conversation|Accept Changes|Approve All)$/i.test(btnText) ||
             actionBtn.classList.contains('gr-action-btn') ||
-            actionBtn.getAttribute('data-testid')?.match(/(approve|accept|run|allow)/i);
+            actionBtn.getAttribute('data-testid')?.match(/(approve|accept|run|allow|deny|reject)/i);
 
         if (isActionButton) {
             console.log('[ACTION] Approval button clicked:', btnText);

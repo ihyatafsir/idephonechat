@@ -499,51 +499,32 @@ async function captureSnapshot(cdp) {
             scrollPercent: scrollContainer.scrollTop / (scrollContainer.scrollHeight - scrollContainer.clientHeight) || 0
         };
         
-        // --- PERFORMANCE FIX: Avoid cloneNode(true) on massive trees ---
-        const msgContainer = scrollContainer.firstElementChild ? scrollContainer : scrollContainer;
-        const liveChildren = Array.from(msgContainer.children);
+        // --- Trim old messages to save phone RAM ---
+        // Keep only the last ~50 message blocks (inside the actual scroll container)
+        const clone = cascade.cloneNode(true);
+        const scrollContainerClone = clone.querySelector('.overflow-y-auto, [data-scroll-area]') || clone;
+        const msgContainer = scrollContainerClone.firstElementChild ? scrollContainerClone : scrollContainerClone;
+        
         const MAX_CHILDREN = 50;
-        
-        // 1. Shallow clone the layout shell down to the message container
-        const clone = cascade.cloneNode(false);
-        let currentCloneParent = clone;
-        
-        // If scrollContainer is nested inside cascade, build the wrapper path
-        if (scrollContainer !== cascade) {
-            let path = [];
-            let curr = scrollContainer;
-            while (curr !== cascade && curr) {
-                path.push(curr);
-                curr = curr.parentElement;
+        const children = Array.from(msgContainer.children);
+        if (children.length > MAX_CHILDREN) {
+            const toRemove = children.length - MAX_CHILDREN;
+            for (let i = 0; i < toRemove; i++) {
+                msgContainer.removeChild(children[i]);
             }
-            path.reverse().forEach(el => {
-                const shallow = el.cloneNode(false);
-                currentCloneParent.appendChild(shallow);
-                currentCloneParent = shallow;
-            });
-        }
-        
-        // 2. Clone ONLY the last 50 message elements into our virtual shell
-        if (liveChildren.length > MAX_CHILDREN) {
-            const trimmedCount = liveChildren.length - MAX_CHILDREN;
+            // Add a small indicator that older messages were trimmed
             const trimNote = document.createElement('div');
             trimNote.style.cssText = 'text-align:center;padding:8px;color:#666;font-size:12px;border-bottom:1px solid #333;margin-bottom:8px;';
-            trimNote.textContent = '⬆ ' + trimmedCount + ' earlier messages not shown (scroll on desktop to see)';
-            currentCloneParent.appendChild(trimNote);
-            
-            const toKeep = liveChildren.slice(trimmedCount);
-            toKeep.forEach(el => currentCloneParent.appendChild(el.cloneNode(true)));
-        } else {
-            liveChildren.forEach(el => currentCloneParent.appendChild(el.cloneNode(true)));
+            trimNote.textContent = '⬆ ' + toRemove + ' earlier messages not shown (scroll on desktop to see)';
+            msgContainer.insertBefore(trimNote, msgContainer.firstChild);
         }
         
-        // 3. Apply cleanup rules (remove inputs, context blocks, etc)
         try {
             const interactionSelectors = [
                 '.relative.flex.flex-col.gap-8',
                 '.flex.grow.flex-col.justify-start.gap-8',
                 'div[class*="interaction-area"]',
-                '.p-1.bg-gray-500\\\\/10',
+                '.p-1.bg-gray-500\\/10',
                 '.outline-solid.justify-between',
                 '[contenteditable="true"]'
             ];
@@ -1147,10 +1128,11 @@ async function setModel(cdp, modelName) {
 
             // Find the dialog/dropdown - search globally (React portals render at body level)
             let visibleDialog = null;
+            const rootSearchWord = '${modelName}'.split(' ')[0]; // E.g., "Gemini", "Claude", "GPT"
             
             // Try specific dialog patterns first
             const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="listbox"], [role="menu"], [data-radix-popper-content-wrapper]'));
-            visibleDialog = dialogs.find(d => d.offsetHeight > 0 && d.innerText?.includes('${modelName}'));
+            visibleDialog = dialogs.find(d => d.offsetHeight > 0 && d.innerText?.includes(rootSearchWord));
             
             // Fallback: look for positioned divs
             if (!visibleDialog) {
@@ -1159,7 +1141,7 @@ async function setModel(cdp, modelName) {
                         const style = window.getComputedStyle(d);
                         return d.offsetHeight > 0 && 
                                (style.position === 'absolute' || style.position === 'fixed') && 
-                               d.innerText?.includes('${modelName}') && 
+                               d.innerText?.includes(rootSearchWord) && 
                                !d.innerText?.includes('Files With Changes');
                     });
             }
@@ -1169,7 +1151,7 @@ async function setModel(cdp, modelName) {
                 const allElements = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"]'));
                 const target = allElements.find(el => 
                     el.offsetParent !== null && 
-                    (el.innerText?.trim() === '${modelName}' || el.innerText?.includes('${modelName}'))
+                    (el.innerText?.trim() === '${modelName}' || el.innerText?.includes(rootSearchWord))
                 );
                 if (target) {
                     target.click();
@@ -1185,17 +1167,29 @@ async function setModel(cdp, modelName) {
             // A. Exact Match (Best)
             let target = validEls.find(el => el.textContent.trim() === '${modelName}');
             
-            // B. Page contains Model
+            // B. Page contains Model exact string
             if (!target) {
                 target = validEls.find(el => el.textContent.includes('${modelName}'));
             }
 
-            // C. Closest partial match
+            // C. Token-based Substring matching (Fuzzy)
             if (!target) {
-                const partialMatches = validEls.filter(el => '${modelName}'.includes(el.textContent.trim()));
-                if (partialMatches.length > 0) {
-                    partialMatches.sort((a, b) => b.textContent.trim().length - a.textContent.trim().length);
-                    target = partialMatches[0];
+                // Break requested model into significant words (ignore numbers, punctuation, short words)
+                // e.g. "Claude Sonnet 4.5" -> ["Claude", "Sonnet"]
+                const searchTokens = '${modelName}'.split(/[\\s\\()]+/).filter(t => /^[a-zA-Z]{3,}$/.test(t));
+                
+                const scoredMatches = validEls.map(el => {
+                    const txt = el.textContent;
+                    let score = 0;
+                    for (const token of searchTokens) {
+                        if (txt.includes(token)) score++;
+                    }
+                    return { el, score };
+                }).filter(m => m.score > 0);
+
+                if (scoredMatches.length > 0) {
+                    scoredMatches.sort((a, b) => b.score - a.score); // Highest score first
+                    target = scoredMatches[0].el;
                 }
             }
 
@@ -1589,54 +1583,32 @@ async function getAppState(cdp) {
         const state = { mode: 'Unknown', model: 'Unknown' };
 
         // 1. Get Mode (Fast/Planning)
-        // Strategy: Find the clickable mode button which contains either "Fast" or "Planning"
-        // It's usually a button or div with cursor:pointer containing the mode text
-        const allEls = Array.from(document.querySelectorAll('*'));
+        const modeTexts = Array.from(document.querySelectorAll('button:not(:disabled), div[role="button"]:not(:disabled)'))
+            .map(el => el.textContent?.trim())
+            .filter(t => t === 'Fast' || t === 'Planning');
+        
+        if (modeTexts.length > 0) {
+            state.mode = modeTexts[0];
+        }
 
-        // Find elements that are likely mode buttons
-        for (const el of allEls) {
-            if (el.children.length > 0) continue;
-            const text = (el.innerText || '').trim();
-            if (text !== 'Fast' && text !== 'Planning') continue;
-
-            // Check if this or a parent is clickable (the actual mode selector)
-            let current = el;
-            for (let i = 0; i < 5; i++) {
-                if (!current) break;
-                const style = window.getComputedStyle(current);
-                if (style.cursor === 'pointer' || current.tagName === 'BUTTON') {
-                    state.mode = text;
+        // 2. Get Model (Gemini, Claude, GPT)
+        // Strategy: Only scan buttons that could be model selectors (usually header)
+        // rather than the whole document.
+        const KNOWN_MODELS = ["Gemini", "Claude", "GPT"];
+        const headerButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        
+        for (const btn of headerButtons) {
+            const txt = btn.textContent || '';
+            if (KNOWN_MODELS.some(k => txt.includes(k))) {
+                // Must have a chevron or be a likely model button
+                if (btn.querySelector('svg[class*="chevron"]') ||
+                    btn.querySelector('svg.lucide-chevron-up') ||
+                    btn.querySelector('svg.lucide-chevron-down') ||
+                    btn.closest('header')) {
+                    state.model = txt.trim();
                     break;
                 }
-                current = current.parentElement;
             }
-            if (state.mode !== 'Unknown') break;
-        }
-
-        // Fallback: Just look for visible text
-        if (state.mode === 'Unknown') {
-            const textNodes = allEls.filter(el => el.children.length === 0 && el.innerText);
-            if (textNodes.some(el => el.innerText.trim() === 'Planning')) state.mode = 'Planning';
-            else if (textNodes.some(el => el.innerText.trim() === 'Fast')) state.mode = 'Fast';
-        }
-
-        // 2. Get Model
-        // Strategy: Look for button containing a known model keyword
-        const KNOWN_MODELS = ["Gemini", "Claude", "GPT"];
-        const textNodes = allEls.filter(el => el.children.length === 0 && el.innerText);
-        const modelEl = textNodes.find(el => {
-            const txt = el.innerText;
-            return KNOWN_MODELS.some(k => txt.includes(k)) &&
-                // Check if it's inside a button or near a chevron SVG (model selector)
-                (el.closest('button')?.querySelector('svg[class*="chevron"]') ||
-                 el.closest('button')?.querySelector('svg.lucide-chevron-up') ||
-                 el.closest('button')?.querySelector('svg.lucide-chevron-down') ||
-                 el.closest('[role="button"]') ||
-                 el.closest('button'));
-        });
-
-        if (modelEl) {
-            state.model = modelEl.innerText.trim();
         }
 
         return state;
