@@ -10,21 +10,22 @@ import fs from 'fs';
 import os from 'os';
 import WebSocket from 'ws';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, basename } from 'path';
 import { inspectUI } from './ui_inspector.js';
 import { execSync, spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const PORTS = [9022, 9222, 9000, 9001, 9002, 9003];
+const PORTS = [9222, 9022, 9000, 9001, 9002, 9003];
 const HEALTH_CHECK_INTERVAL = 30000; // 30s health check (reduced CDP load)
-const FALLBACK_SNAPSHOT_INTERVAL = 120000; // 120s — only if no push received
-const PUSH_FETCH_THROTTLE = 2000; // Min 2s between server-side snapshot fetches (snappier updates)
+const FALLBACK_SNAPSHOT_INTERVAL = 30000; // 30s fallback check
+const PUSH_FETCH_THROTTLE = 2000; // 2s throttle between snapshot broadcasts
 const SERVER_PORT = process.env.PORT || 3000;
 const APP_PASSWORD = process.env.APP_PASSWORD || 'antigravity';
 const AUTH_COOKIE_NAME = 'ag_auth_token';
 let AUTH_TOKEN = 'ag_default_token';
+let globalWss = null;
 
 // Shared CDP connection
 let cdpConnection = null;
@@ -52,8 +53,28 @@ let pendingPushFetch = false; // Whether a throttled push fetch is scheduled
 
 // Message queue — holds messages when agent is busy (terminal running)
 const messageQueue = [];
-const MAX_QUEUED_MESSAGES = 5;
+const MAX_QUEUED_MESSAGES = 10;
 let isProcessingQueue = false;
+
+function broadcastQueueUpdate(wss) {
+    const targetWss = wss || globalWss;
+    if (!targetWss) return;
+    const payload = JSON.stringify({
+        type: 'queue_update',
+        count: messageQueue.length,
+        items: messageQueue.map(m => ({
+            id: m.id,
+            text: m.text,
+            timestamp: m.timestamp,
+            attempts: m.attempts || 0
+        }))
+    });
+    for (const client of targetWss.clients) {
+        if (client.readyState === 1) { // WebSocket.OPEN
+            try { client.send(payload); } catch (e) { }
+        }
+    }
+}
 
 // Kill any existing process on the server port (prevents EADDRINUSE)
 function killPortProcess(port) {
@@ -77,7 +98,7 @@ function killPortProcess(port) {
         } else {
             // Linux/macOS: Use lsof and kill
             const result = execSync(`lsof -ti:${port}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-            const pids = result.trim().split('\n').filter(p => p);
+            const pids = result.trim().split('\n').filter(p => p && p.trim() !== String(process.pid));
             for (const pid of pids) {
                 try {
                     execSync(`kill -9 ${pid}`, { stdio: 'pipe' });
@@ -120,46 +141,70 @@ function getLocalIP() {
     return candidates.length > 0 ? candidates[0].address : 'localhost';
 }
 
-// Helper: HTTP GET JSON
-function getJson(url) {
+// Helper: HTTP GET JSON with timeout
+function getJson(url, timeoutMs = 2500) {
     return new Promise((resolve, reject) => {
-        http.get(url, (res) => {
+        const req = http.get(url, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
             });
-        }).on('error', reject);
+        });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error(`Timeout after ${timeoutMs}ms connecting to ${url}`));
+        });
     });
 }
 
-// Find Antigravity CDP endpoint
-// Find Antigravity CDP endpoint
+// Find Antigravity CDP endpoint (Fast Parallel Discovery)
 async function discoverCDP() {
-    const errors = [];
-    for (const port of PORTS) {
+    const checkPort = async (port) => {
         try {
-            const list = await getJson(`http://127.0.0.1:${port}/json/list`);
+            const list = await getJson(`http://127.0.0.1:${port}/json/list`, 1000);
+            if (!Array.isArray(list)) return null;
 
-            // Priority 1: Standard Workbench (The main window)
-            const workbench = list.find(t => t.url?.includes('workbench.html') || (t.title && t.title.includes('workbench')));
+            // Filter out self/3000 pages to avoid loopback
+            const validList = list.filter(t => {
+                const url = (t.url || "").toLowerCase();
+                const title = (t.title || "").toLowerCase();
+                if (url.includes(":3000") || title.includes("phone connect") || title.includes("gravityremote")) return false;
+                return true;
+            });
+
+            // Priority 1: Standard Workbench (The main IDE window)
+            const workbench = validList.find(t => t.url?.includes("workbench.html") || (t.title && (t.title.includes("workbench") || t.title.includes("Antigravity IDE"))));
             if (workbench && workbench.webSocketDebuggerUrl) {
-                console.log('Found Workbench target:', workbench.title);
-                return { port, url: workbench.webSocketDebuggerUrl };
+                return { priority: 1, port, url: workbench.webSocketDebuggerUrl, title: workbench.title };
             }
 
             // Priority 2: Jetski/Launchpad (Fallback)
-            const jetski = list.find(t => t.url?.includes('jetski') || t.title === 'Launchpad');
+            const jetski = validList.find(t => t.url?.includes("jetski") || t.title === "Launchpad");
             if (jetski && jetski.webSocketDebuggerUrl) {
-                console.log('Found Jetski/Launchpad target:', jetski.title);
-                return { port, url: jetski.webSocketDebuggerUrl };
+                return { priority: 2, port, url: jetski.webSocketDebuggerUrl, title: jetski.title };
             }
+
+            // Priority 3: Any other valid page
+            const page = validList.find(t => t.type === "page" && t.webSocketDebuggerUrl);
+            if (page) {
+                return { priority: 3, port, url: page.webSocketDebuggerUrl, title: page.title };
+            }
+            return null;
         } catch (e) {
-            errors.push(`${port}: ${e.message}`);
+            return null;
         }
+    };
+
+    const results = await Promise.all(PORTS.map(checkPort));
+    const valid = results.filter(Boolean).sort((a, b) => a.priority - b.priority);
+
+    if (valid.length > 0) {
+        console.log(`Found target on port ${valid[0].port}:`, valid[0].title);
+        return { port: valid[0].port, url: valid[0].url };
     }
-    const errorSummary = errors.length ? `Errors: ${errors.join(', ')}` : 'No ports responding';
-    throw new Error(`CDP not found. ${errorSummary}`);
+
+    throw new Error('CDP endpoint not found on any monitored port');
 }
 
 // Connect to CDP
@@ -316,6 +361,11 @@ async function ensureCDP() {
             if (cdpConnection) {
                 console.log('✅ ensureCDP: reconnected!');
                 reconnectAttempts = 0;
+                observerInjected = false;
+                if (globalWss) {
+                    wirePushHandler(globalWss);
+                }
+                injectObserver(cdpConnection).catch(() => {});
                 return true;
             }
         } catch (e) {
@@ -331,44 +381,73 @@ async function ensureCDP() {
     }
 }
 
-// Lightweight "is agent busy?" probe — only checks the cancel button, no inject attempt
+// Lightweight "is agent busy?" probe — checks cancel buttons and active state
 // Returns true if agent is busy (cancel button visible), false if idle
 async function isAgentBusy(cdp) {
-    if (!cdp || cdp.ws?.readyState !== WebSocket.OPEN) return true; // Assume busy if no connection
+    if (!cdp || cdp.ws?.readyState !== WebSocket.OPEN) return true;
 
-    // Try cached cascade context first, then scan up to 2
+    const PROBE_SCRIPT = `(() => {
+        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]') ||
+                       document.querySelector('button[aria-label*="Cancel" i]') ||
+                       document.querySelector('button[aria-label*="Stop" i]') ||
+                       document.querySelector('button[title*="Cancel" i]') ||
+                       document.querySelector('button[title*="Stop" i]') ||
+                       document.querySelector('button svg.lucide-square')?.closest('button') ||
+                       document.querySelector('button .bg-red-500')?.closest('button') ||
+                       document.querySelector('button svg.lucide-stop-circle')?.closest('button') ||
+                       document.querySelector('button svg.lucide-circle-stop')?.closest('button');
+        if (cancel && cancel.offsetParent !== null) return "busy";
+
+        const editor = document.querySelector('div[contenteditable="true"][role="combobox"]') ||
+                       document.querySelector('div[contenteditable="true"][aria-label="Message input"]') ||
+                       document.querySelector('[data-lexical-editor="true"][contenteditable="true"]') ||
+                       document.querySelector('div[contenteditable="true"][role="textbox"]') ||
+                       document.querySelector('div[contenteditable="true"]');
+        if (editor && editor.offsetParent !== null) return "idle";
+        return "unknown";
+    })()`;
+
+    // Try default context first
+    try {
+        const res = await Promise.race([
+            cdp.call("Runtime.evaluate", {
+                expression: PROBE_SCRIPT,
+                returnByValue: true
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1200))
+        ]);
+        const val = res.result?.value;
+        if (val === "busy") return true;
+        if (val === "idle") return false;
+    } catch (e) { }
+
+    // Try tracked contexts
     const ctxIds = [];
     if (cachedCascadeCtxId && cdp.contexts.some(c => c.id === cachedCascadeCtxId)) {
         ctxIds.push(cachedCascadeCtxId);
     }
     for (const ctx of cdp.contexts) {
-        if (ctx.origin?.includes('extension') || ctx.name?.includes('worker')) continue;
+        if (ctx.origin?.includes("extension") || ctx.name?.includes("worker")) continue;
         if (!ctxIds.includes(ctx.id)) ctxIds.push(ctx.id);
-        if (ctxIds.length >= 2) break;
+        if (ctxIds.length >= 3) break;
     }
 
     for (const ctxId of ctxIds) {
         try {
             const result = await Promise.race([
                 cdp.call("Runtime.evaluate", {
-                    expression: `(() => {
-                        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
-                        if (cancel && cancel.offsetParent !== null) return "busy";
-                        const editor = document.querySelector('[data-lexical-editor="true"][contenteditable="true"][role="textbox"]');
-                        if (editor && editor.offsetParent !== null) return "idle";
-                        return "unknown";
-                    })()`,
+                    expression: PROBE_SCRIPT,
                     returnByValue: true,
                     contextId: ctxId
                 }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
+                new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1200))
             ]);
             const val = result.result?.value;
             if (val === "busy") return true;
             if (val === "idle") return false;
-        } catch (e) { /* try next context */ }
+        } catch (e) { }
     }
-    return true; // Unknown = assume busy
+    return false;
 }
 
 // Lightweight pre-check: just get innerHTML length + scroll position without cloning DOM
@@ -430,7 +509,12 @@ async function captureSnapshot(cdp) {
     } else {
         // Scan all contexts to find the right one (lightweight check)
         cachedSnapshotCtxId = null;
-        for (const ctx of cdp.contexts) {
+        const sortedContexts = [...cdp.contexts].sort((a, b) => {
+            const aDef = (a.auxData?.isDefault || a.id === 1) ? 1 : 0;
+            const bDef = (b.auxData?.isDefault || b.id === 1) ? 1 : 0;
+            return bDef - aDef;
+        });
+        for (const ctx of sortedContexts) {
             try {
                 const probe = await cdp.call("Runtime.evaluate", {
                     expression: LIGHT_CHECK_SCRIPT,
@@ -560,6 +644,13 @@ async function captureSnapshot(cdp) {
             });
         } catch (globalErr) { }
         
+        clone.querySelectorAll('[style*="container-type"]').forEach(el => {
+            el.style.containerType = 'normal';
+        });
+        clone.querySelectorAll('.overflow-hidden, .overflow-y-hidden, .overflow-y-auto').forEach(el => {
+            el.style.overflow = 'visible';
+            el.style.height = 'auto';
+        });
         const html = clone.outerHTML;
         
         return {
@@ -625,7 +716,6 @@ async function captureSnapshot(cdp) {
 // Inject message into Antigravity — routes through Agent Mode (Ctrl+E)
 // Heavily optimized: cached context, 2s timeouts, 12s overall limit
 async function injectMessage(cdp, text) {
-    // Overall timeout: never let this function hang > 12s
     return Promise.race([
         _injectMessageInner(cdp, text),
         new Promise(resolve => setTimeout(() => resolve({ ok: false, error: 'inject_timeout_12s' }), 12000))
@@ -633,186 +723,173 @@ async function injectMessage(cdp, text) {
 }
 
 async function _injectMessageInner(cdp, text) {
-    // Wait for contexts (brief)
-    if (cdp.contexts.length === 0) {
-        await new Promise(r => setTimeout(r, 500));
-        if (cdp.contexts.length === 0) {
-            return { ok: false, error: 'no_contexts_available' };
-        }
+    let cascadeCtxId = undefined;
+
+    const FIND_EDITOR_EXPR = `(() => {
+        const editor = document.querySelector('div[contenteditable="true"][role="combobox"]') ||
+                       document.querySelector('div[contenteditable="true"][aria-label="Message input"]') ||
+                       document.querySelector('[data-lexical-editor="true"][contenteditable="true"]') ||
+                       document.querySelector('div[contenteditable="true"][role="textbox"]') ||
+                       document.querySelector('div[contenteditable="true"]');
+        if (editor && editor.offsetParent !== null) return "found";
+        return "not_found";
+    })()`;
+
+    // 1. Check candidate contexts in priority order
+    const candidateCtxIds = [];
+    if (cachedCascadeCtxId !== null && cachedCascadeCtxId !== undefined && cdp.contexts.some(c => c.id === cachedCascadeCtxId)) {
+        candidateCtxIds.push(cachedCascadeCtxId);
+    }
+    if (cachedSnapshotCtxId !== null && cachedSnapshotCtxId !== undefined && cdp.contexts.some(c => c.id === cachedSnapshotCtxId) && !candidateCtxIds.includes(cachedSnapshotCtxId)) {
+        candidateCtxIds.push(cachedSnapshotCtxId);
+    }
+    candidateCtxIds.push(null); // default context
+    for (const ctx of cdp.contexts) {
+        if (ctx.origin?.includes("extension") || ctx.name?.includes("worker")) continue;
+        if (!candidateCtxIds.includes(ctx.id)) candidateCtxIds.push(ctx.id);
     }
 
-    // Step 1: Find cascade context (use cache first, then scan max 3)
-    let cascadeCtxId = null;
-    let alreadyInAgentMode = false;
-
-    // Try cached context first (instant)
-    if (cachedCascadeCtxId && cdp.contexts.some(c => c.id === cachedCascadeCtxId)) {
+    for (const ctxId of candidateCtxIds) {
         try {
-            const result = await Promise.race([
-                cdp.call("Runtime.evaluate", {
-                    expression: `(() => {
-                        const isCascade = document.querySelector('[data-tooltip-id="cascade-header-menu"]') ||
-                                          document.querySelector('[data-tooltip-id="new-conversation-tooltip"]') ||
-                                          document.querySelector('[data-tooltip-id="history-tooltip"]');
-                        if (!isCascade) return "wrong_context";
-                        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
-                        if (cancel && cancel.offsetParent !== null) return "busy";
-                        const editor = document.querySelector('[data-lexical-editor="true"][contenteditable="true"][role="textbox"]') ||
-                                       document.querySelector('div[contenteditable="true"][role="textbox"]');
-                        if (editor && editor.offsetParent !== null) return "agent_ready";
-                        return "ready";
-                    })()`,
-                    returnByValue: true,
-                    contextId: cachedCascadeCtxId
-                }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+            const probeParams = { expression: FIND_EDITOR_EXPR, returnByValue: true };
+            if (ctxId !== null) probeParams.contextId = ctxId;
+            const probe = await Promise.race([
+                cdp.call("Runtime.evaluate", probeParams),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1200))
             ]);
-            const val = result.result?.value;
-            if (val === "busy") return { ok: false, reason: "busy" };
-            if (val === "agent_ready") { cascadeCtxId = cachedCascadeCtxId; alreadyInAgentMode = true; }
-            else if (val === "ready") { cascadeCtxId = cachedCascadeCtxId; }
-            else { cachedCascadeCtxId = null; } // Cache invalid
-        } catch (e) { cachedCascadeCtxId = null; }
+            if (probe.result?.value === "found") {
+                cascadeCtxId = ctxId;
+                if (ctxId !== null) cachedCascadeCtxId = ctxId;
+                break;
+            }
+        } catch (e) { }
     }
 
-    // Scan contexts if cache missed (limit to 3, skip obviously-wrong ones)
-    if (!cascadeCtxId) {
-        let scanned = 0;
-        for (const ctx of cdp.contexts) {
-            // Skip extension/worker contexts
-            if (ctx.origin?.includes('extension') || ctx.name?.includes('worker')) continue;
-            if (scanned++ >= 3) break; // Max 3 context probes
+    // 3. Focus editor and thoroughly clear previous text (multi-layer clean)
+    const focusParams = {
+        expression: `(() => {
+            let editor = document.querySelector('div[contenteditable="true"][role="combobox"]') ||
+                         document.querySelector('div[contenteditable="true"][aria-label="Message input"]') ||
+                         document.querySelector('[data-lexical-editor="true"][contenteditable="true"]') ||
+                         document.querySelector('div[contenteditable="true"][role="textbox"]') ||
+                         document.querySelector('div[contenteditable="true"]');
+            if (!editor) {
+                const cascadePanel = document.querySelector('#conversation, #chat, #cascade');
+                if (cascadePanel) {
+                    const editables = [...cascadePanel.querySelectorAll('[contenteditable="true"]')]
+                        .filter(el => el.offsetParent !== null);
+                    editor = editables.at(-1);
+                }
+            }
+            if (!editor) return { ok: false, error: "editor_not_found" };
+            editor.focus();
             try {
-                const result = await Promise.race([
-                    cdp.call("Runtime.evaluate", {
-                        expression: `(() => {
-                            const isCascade = document.querySelector('[data-tooltip-id="cascade-header-menu"]') ||
-                                              document.querySelector('[data-tooltip-id="new-conversation-tooltip"]') ||
-                                              document.querySelector('[data-tooltip-id="history-tooltip"]');
-                            if (!isCascade) return "wrong_context";
-                            const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
-                            if (cancel && cancel.offsetParent !== null) return "busy";
-                            const editor = document.querySelector('[data-lexical-editor="true"][contenteditable="true"][role="textbox"]') ||
-                                           document.querySelector('div[contenteditable="true"][role="textbox"]');
-                            if (editor && editor.offsetParent !== null) return "agent_ready";
-                            return "ready";
-                        })()`,
-                        returnByValue: true,
-                        contextId: ctx.id
-                    }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
-                ]);
-                const val = result.result?.value;
-                if (val === "busy") { cachedCascadeCtxId = ctx.id; return { ok: false, reason: "busy" }; }
-                if (val === "agent_ready") { cascadeCtxId = ctx.id; cachedCascadeCtxId = ctx.id; alreadyInAgentMode = true; break; }
-                if (val === "ready") { cascadeCtxId = ctx.id; cachedCascadeCtxId = ctx.id; break; }
-            } catch (e) { }
-        }
-    }
+                const sel = window.getSelection();
+                if (sel) {
+                    sel.removeAllRanges();
+                    const range = document.createRange();
+                    range.selectNodeContents(editor);
+                    sel.addRange(range);
+                }
+            } catch(e) {}
+            return { ok: true };
+        })()`,
+        returnByValue: true
+    };
+    if (cascadeCtxId) focusParams.contextId = cascadeCtxId;
 
-    if (!cascadeCtxId) {
-        return { ok: false, error: "cascade_not_found" };
-    }
-
-    // Step 2: Ctrl+E for agent mode (only if needed)
-    if (!alreadyInAgentMode) {
-        try {
-            await cdp.call("Input.dispatchKeyEvent", {
-                type: "keyDown", key: "e", code: "KeyE",
-                modifiers: 2, windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69
-            });
-            await cdp.call("Input.dispatchKeyEvent", {
-                type: "keyUp", key: "e", code: "KeyE",
-                modifiers: 2, windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69
-            });
-            console.log('[INJECT] Sent Ctrl+E');
-        } catch (e) {
-            return { ok: false, error: "ctrl_e_failed: " + e.message };
-        }
-    }
-
-    // Wait for agent mode (reduced from 800ms)
-    await new Promise(r => setTimeout(r, 400));
-
-    // Step 3: Focus editor and type
     try {
         const focusResult = await Promise.race([
-            cdp.call("Runtime.evaluate", {
-                expression: `(() => {
-                    let editor = document.querySelector('[data-lexical-editor="true"][contenteditable="true"][role="textbox"]');
-                    if (!editor) editor = document.querySelector('div[contenteditable="true"][role="textbox"]');
-                    if (!editor) {
-                        const cascadePanel = document.querySelector('#cascade, #conversation, #chat');
-                        if (cascadePanel) {
-                            const editables = [...cascadePanel.querySelectorAll('[contenteditable="true"]')]
-                                .filter(el => el.offsetParent !== null);
-                            editor = editables.at(-1);
-                        }
-                    }
-                    if (!editor) return { ok: false, error: "editor_not_found" };
-                    editor.focus();
-                    const sel = window.getSelection();
-                    if (sel) sel.selectAllChildren(editor);
-                    document.execCommand('delete');
-                    return { ok: true };
-                })()`,
-                returnByValue: true,
-                contextId: cascadeCtxId
-            }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+            cdp.call("Runtime.evaluate", focusParams),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000))
         ]);
 
         if (focusResult.result?.value?.ok === false) {
             return { ok: false, error: focusResult.result.value.error || "focus_failed" };
         }
 
+        // Native CDP Clear: Ctrl+A -> Backspace -> Delete
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyDown", key: "a", code: "KeyA",
+            modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "a", code: "KeyA",
+            modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyDown", key: "Backspace", code: "Backspace",
+            windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "Backspace", code: "Backspace",
+            windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
+        });
+
+        await new Promise(r => setTimeout(r, 60));
+
+        // Insert text via CDP native typing
         await cdp.call("Input.insertText", { text });
-        console.log('[INJECT] Typed text');
+        console.log(`[INJECT] Typed ${text.length} chars`);
 
         await new Promise(r => setTimeout(r, 200));
     } catch (e) {
         return { ok: false, error: "insert_exception: " + e.message };
     }
 
-    // Step 4: Click send button (reduced timeout from 8s to 3s)
-    await new Promise(r => setTimeout(r, 300));
-
+    // 4. Submit message (Enter key + Button click)
     try {
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "rawKeyDown", key: "Enter", code: "Enter",
+            windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "Enter", code: "Enter",
+            windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13
+        });
+
+        await new Promise(r => setTimeout(r, 100));
+
+        const clickParams = {
+            expression: `(async () => {
+                let submit = null;
+                for (let retry = 0; retry < 5; retry++) {
+                    submit = document.querySelector('[data-tooltip-id="input-send-button-send-tooltip"]') ||
+                             document.querySelector('[data-tooltip-id="input-send-button-pending-tooltip"]') ||
+                             document.querySelector('[data-tooltip-id*="queue" i]') ||
+                             document.querySelector('button[aria-label*="Queue" i]') ||
+                             document.querySelector('button[aria-label*="Interrupt" i]') ||
+                             document.querySelector('button[aria-label^="Send" i]') ||
+                             document.querySelector('button[aria-label*="Queue" i]') ||
+                             document.querySelector('button svg.lucide-arrow-right')?.closest('button') ||
+                             document.querySelector('button svg.lucide-corner-down-left')?.closest('button');
+                    if (submit && !submit.disabled && submit.offsetParent !== null) break;
+                    submit = null;
+                    await new Promise(r => setTimeout(r, 80));
+                }
+                if (submit && !submit.disabled) {
+                    submit.click();
+                    try {
+                        submit.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                    } catch(e) {}
+                    return { ok: true, method: "button_click" };
+                }
+                return { ok: true, method: "enter_key_submit" };
+            })()`,
+            returnByValue: true,
+            awaitPromise: true
+        };
+        if (cascadeCtxId) clickParams.contextId = cascadeCtxId;
+
         const clickResult = await Promise.race([
-            cdp.call("Runtime.evaluate", {
-                expression: `(async () => {
-                    let submit = null;
-                    for (let retry = 0; retry < 4; retry++) {
-                        submit = document.querySelector('[data-tooltip-id="input-send-button-send-tooltip"]');
-                        if (submit && !submit.disabled) break;
-                        submit = document.querySelector("svg.lucide-arrow-right")?.closest("button");
-                        if (submit && !submit.disabled) break;
-                        submit = document.querySelector('[data-tooltip-id="input-send-button-pending-tooltip"]');
-                        if (submit && !submit.disabled) break;
-                        submit = null;
-                        await new Promise(r => setTimeout(r, 150));
-                    }
-                    if (submit && !submit.disabled) {
-                        submit.click();
-                        return { ok: true, method: "agent_mode_submit" };
-                    }
-                    return { ok: false, error: "send_btn_not_found" };
-                })()`,
-                returnByValue: true,
-                awaitPromise: true,
-                contextId: cascadeCtxId
-            }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+            cdp.call("Runtime.evaluate", clickParams),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000))
         ]);
 
-        if (clickResult.result?.value) {
-            return clickResult.result.value;
-        }
+        return clickResult.result?.value || { ok: true, method: "submitted" };
     } catch (e) {
-        return { ok: false, error: "click_timeout: " + e.message };
+        return { ok: true, method: "enter_fallback" };
     }
-
-    return { ok: false, error: "click_failed" };
 }
 
 // Set functionality mode (Fast vs Planning)
@@ -914,62 +991,127 @@ async function setMode(cdp, mode) {
     return { error: 'Context failed' };
 }
 
-// Stop Generation
+// Stop Generation — cancels generation reliably and clears messageQueue
 async function stopGeneration(cdp) {
-    // Step 1: Find the cascade-panel context and try clicking the cancel button
-    for (const ctx of cdp.contexts) {
-        try {
-            const res = await Promise.race([
-                cdp.call("Runtime.evaluate", {
-                    expression: `(() => {
-                        // Verify cascade-panel context
-                        const isCascade = document.querySelector('[data-tooltip-id="cascade-header-menu"]') ||
-                                          document.querySelector('[data-tooltip-id="new-conversation-tooltip"]') ||
-                                          document.querySelector('[data-tooltip-id="history-tooltip"]');
-                        if (!isCascade) return { skip: true };
-                        
-                        // Look for the cancel button
-                        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
-                        if (cancel && cancel.offsetParent !== null) {
-                            cancel.click();
-                            return { success: true, method: "cancel_click" };
-                        }
-                        
-                        // Fallback: square icon button
-                        const stopBtn = document.querySelector('button svg.lucide-square')?.closest('button');
-                        if (stopBtn && stopBtn.offsetParent !== null) {
-                            stopBtn.click();
-                            return { success: true, method: "square_click" };
-                        }
-                        
-                        return { error: "No active generation found to stop" };
-                    })()`,
-                    returnByValue: true,
-                    contextId: ctx.id
-                }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
-            ]);
+    let stopped = false;
+    let method = "none";
 
-            const val = res.result?.value;
-            if (val?.skip) continue;
-            if (val?.success) return val;
-            if (val?.error) {
-                // Found cascade panel but no cancel button — try Escape key via CDP
-                try {
-                    await cdp.call("Input.dispatchKeyEvent", {
-                        type: "keyDown", key: "Escape", code: "Escape", keyCode: 27
-                    });
-                    await cdp.call("Input.dispatchKeyEvent", {
-                        type: "keyUp", key: "Escape", code: "Escape", keyCode: 27
-                    });
-                    return { success: true, method: "escape_key" };
-                } catch (e) {
-                    return val;
+    const CANCEL_SCRIPT = `(() => {
+        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]') ||
+                       document.querySelector('button[aria-label*="Cancel" i]') ||
+                       document.querySelector('button[aria-label*="Stop" i]') ||
+                       document.querySelector('button[title*="Cancel" i]') ||
+                       document.querySelector('button[title*="Stop" i]') ||
+                       document.querySelector('button svg.lucide-square')?.closest('button') ||
+                       document.querySelector('button .bg-red-500')?.closest('button') ||
+                       document.querySelector('button svg.lucide-stop-circle')?.closest('button') ||
+                       document.querySelector('button svg.lucide-circle-stop')?.closest('button');
+        if (cancel && cancel.offsetParent !== null) {
+            cancel.click();
+            try {
+                cancel.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                cancel.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
+                cancel.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+                cancel.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+                cancel.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window }));
+            } catch (e) {}
+            return { success: true, method: "cancel_button_click" };
+        }
+        return { not_found: true };
+    })()`;
+
+    // 1. Try finding and clicking cancel in default context
+    try {
+        const res = await Promise.race([
+            cdp.call("Runtime.evaluate", {
+                expression: CANCEL_SCRIPT,
+                returnByValue: true
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000))
+        ]);
+        const val = res.result?.value;
+        if (val?.success) {
+            stopped = true;
+            method = val.method;
+        }
+    } catch (e) { }
+
+    // 2. Try across tracked contexts
+    if (!stopped && cdp.contexts && cdp.contexts.length > 0) {
+        for (const ctx of cdp.contexts) {
+            try {
+                const res = await Promise.race([
+                    cdp.call("Runtime.evaluate", {
+                        expression: CANCEL_SCRIPT,
+                        returnByValue: true,
+                        contextId: ctx.id
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000))
+                ]);
+                const val = res.result?.value;
+                if (val?.success) {
+                    stopped = true;
+                    method = val.method;
+                    break;
                 }
-            }
-        } catch (e) { }
+            } catch (e) { }
+        }
     }
-    return { error: 'Cascade panel not found in any context' };
+
+    // 3. Dispatch native keyboard shortcuts (Ctrl+D, Escape, Ctrl+C)
+    try {
+        // Ctrl+D (Antigravity stop generation)
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "rawKeyDown", key: "d", code: "KeyD",
+            modifiers: 2, windowsVirtualKeyCode: 68, nativeVirtualKeyCode: 68
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "d", code: "KeyD",
+            modifiers: 2, windowsVirtualKeyCode: 68, nativeVirtualKeyCode: 68
+        });
+
+        // Escape (Abort)
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "rawKeyDown", key: "Escape", code: "Escape", keyCode: 27, windowsVirtualKeyCode: 27
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "Escape", code: "Escape", keyCode: 27, windowsVirtualKeyCode: 27
+        });
+
+        // Ctrl+C (Terminal abort)
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "rawKeyDown", key: "c", code: "KeyC",
+            modifiers: 2, windowsVirtualKeyCode: 67, nativeVirtualKeyCode: 67
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "c", code: "KeyC",
+            modifiers: 2, windowsVirtualKeyCode: 67, nativeVirtualKeyCode: 67
+        });
+
+        if (!stopped) {
+            stopped = true;
+            method = "keyboard_shortcut";
+        }
+    } catch (e) {
+        console.warn("Keyboard cancel dispatch error:", e.message);
+    }
+
+    // 4. Clear server messageQueue on Stop
+    const clearedCount = messageQueue.length;
+    messageQueue.length = 0;
+    isProcessingQueue = false;
+    if (clearedCount > 0) {
+        console.log(`🛑 Cleared ${clearedCount} pending queued message(s) on Stop.`);
+    }
+
+    // 5. Force snapshot refresh and broadcast immediately
+    if (globalWss) {
+        setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 200);
+        setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 800);
+        broadcastQueueUpdate(globalWss);
+    }
+
+    return { success: true, method, clearedQueue: clearedCount };
 }
 
 // Click Element (Remote)
@@ -1076,7 +1218,7 @@ async function setModel(cdp, modelName) {
             let modelBtn = null;
             
             // Strategy 1: Look for data-tooltip-id patterns (most reliable)
-            modelBtn = document.querySelector('[data-tooltip-id*="model"], [data-tooltip-id*="provider"]');
+            modelBtn = document.querySelector('[data-testid="model-selector-trigger"], [data-tooltip-id*="model"], [data-tooltip-id*="provider"]');
             
             // Strategy 2: Look for buttons/elements containing model keywords with SVG icons
             if (!modelBtn) {
@@ -1227,143 +1369,38 @@ async function setModel(cdp, modelName) {
     return bestResult || { error: 'Context failed' };
 }
 
-// Start New Chat - Use Agent Manager Shortcut Ctrl+L
+// Start New Chat - Click New Conversation button in cascade context or fallback to shortcuts
 async function startNewChat(cdp) {
-    try {
-        console.log('[NEW-CHAT] ⌨️ Sending Ctrl+L to trigger new Agent Chat');
-        // Press Ctrl
-        await cdp.call("Input.dispatchKeyEvent", {
-            type: "keyDown", key: "Control", code: "ControlLeft",
-            modifiers: 2, windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17
-        });
-        // Press E
-        await cdp.call("Input.dispatchKeyEvent", {
-            type: "keyDown", key: "e", code: "KeyE",
-            modifiers: 2, windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69
-        });
-        // Release E
-        await cdp.call("Input.dispatchKeyEvent", {
-            type: "keyUp", key: "e", code: "KeyE",
-            modifiers: 2, windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69
-        });
-        // Release Ctrl
-        await cdp.call("Input.dispatchKeyEvent", {
-            type: "keyUp", key: "Control", code: "ControlLeft",
-            modifiers: 0, windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17
-        });
-        return { success: true, method: 'cdp_shortcut_ctrl_l' };
-    } catch (e) {
-        console.error('[NEW-CHAT] ❌ Shortcut failed:', e.message);
-        return { error: 'Shortcut failed: ' + e.message };
-    }
-}
-// Get Chat History - Two-phase: click in iframe context, scrape from parent context
-async function getChatHistory(cdp) {
-    // Phase 1: Click the history button (runs in iframe context where button lives)
     const CLICK_EXP = `(async () => {
         try {
-            let historyBtn = document.querySelector('[data-tooltip-id="history-tooltip"]');
-            if (!historyBtn) {
-                historyBtn = document.querySelector('[data-tooltip-id*="history"], [data-tooltip-id*="past"], [data-tooltip-id*="recent"]');
+            // Priority 1: Exact new-conversation tooltip anchor
+            const newBtn = document.querySelector('[data-tooltip-id="new-conversation-tooltip"]') ||
+                           document.querySelector('a[data-tooltip-id*="new-conversation"]') ||
+                           document.querySelector('[data-past-conversations-toggle="true"]')?.parentElement?.querySelector('[data-tooltip-id*="new"]');
+            if (newBtn) {
+                newBtn.click();
+                return { success: true, method: 'dom_new_conversation_tooltip', tag: newBtn.tagName };
             }
-            if (!historyBtn) {
-                const newChatBtn = document.querySelector('[data-tooltip-id="new-conversation-tooltip"]');
-                if (newChatBtn) {
-                    const parent = newChatBtn.parentElement;
-                    if (parent) {
-                        const siblings = Array.from(parent.children).filter(el => el !== newChatBtn);
-                        historyBtn = siblings.find(el => el.tagName === 'A' || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button');
-                    }
-                }
+            // Priority 2: Generic plus buttons in chat header
+            const allPlus = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(el => {
+                if (el.offsetParent === null) return false;
+                const txt = el.innerText?.trim() || '';
+                const aria = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                if (/new conversation|new chat|start new/i.test(aria) || /new conversation|new chat/i.test(txt)) return true;
+                const path = el.querySelector('path');
+                if (path && (path.getAttribute('d') || '').includes('450-450H220')) return true;
+                return false;
+            });
+            if (allPlus.length > 0) {
+                allPlus[0].click();
+                return { success: true, method: 'dom_plus_button', tag: allPlus[0].tagName };
             }
-            if (!historyBtn) return { clicked: false };
-            historyBtn.click();
-            return { clicked: true };
+            return { clicked: false };
         } catch(e) {
             return { clicked: false, error: e.toString() };
         }
     })()`;
 
-    // Phase 2: Scrape the history panel - tries cascade + workbench contexts
-    const SCRAPE_EXP = `(async () => {
-        try {
-            const chats = [];
-            const seenTitles = new Set();
-            const SKIP = new Set(['current', 'current conversation', 'other conversations',
-                'now', 'recent', 'blocked on your input', 'select a conversation',
-                'no conversations', 'loading']);
-            
-            function isConversationTitle(text) {
-                if (!text || text.length < 3 || text.length > 200) return false;
-                const lower = text.toLowerCase();
-                if (SKIP.has(lower)) return false;
-                if (lower.endsWith(' ago')) return false;
-                if (/^\\d+\\s*(sec|min|hr|day|wk|mo|yr|mins?|hours?|days?|weeks?)/i.test(lower)) return false;
-                if (lower.startsWith('show ') && lower.includes('more')) return false;
-                if (lower.startsWith('recent in ')) return false;
-                if (/^[\\d:]+$/.test(lower)) return false; // timestamps
-                return true;
-            }
-            
-            function addChat(text) {
-                text = text.trim();
-                if (!isConversationTitle(text)) return false;
-                if (seenTitles.has(text)) return false;
-                seenTitles.add(text);
-                chats.push({ title: text, date: 'Recent' });
-                return true;
-            }
-            
-            // Strategy 1: VS Code Quick Pick / Quick Input list items
-            const listItems = document.querySelectorAll(
-                '.monaco-list-row, .quick-input-list-entry, [role="listitem"], [role="option"], [role="treeitem"]'
-            );
-            for (const item of listItems) {
-                const label = item.querySelector('.label-name, .label-description, .quick-input-list-label');
-                const text = label?.textContent || item.querySelector('span')?.textContent || item.textContent;
-                addChat(text || '');
-                if (chats.length >= 50) break;
-            }
-            
-            // Strategy 2: cursor-pointer items (custom Cascade UI)
-            if (chats.length === 0) {
-                const clickableItems = document.querySelectorAll('[class*="cursor-pointer"]');
-                for (const item of clickableItems) {
-                    const titleEl = item.querySelector('span[class*="truncate"], span[class*="text-sm"]') || item.querySelector('span');
-                    if (titleEl) addChat(titleEl.textContent || '');
-                    if (chats.length >= 50) break;
-                }
-            }
-            
-            // Strategy 3: Scan visible spans that look like conversation titles
-            if (chats.length === 0) {
-                const allSpans = document.querySelectorAll('span');
-                for (const span of allSpans) {
-                    if (span.offsetParent === null) continue; // not visible
-                    addChat(span.textContent || '');
-                    if (chats.length >= 50) break;
-                }
-            }
-            
-            // Debug info for troubleshooting when empty
-            let debug = null;
-            if (chats.length === 0) {
-                const allRoles = [...new Set([...document.querySelectorAll('[role]')].map(el => el.getAttribute('role')))];
-                const visibleInputs = [...document.querySelectorAll('input')].filter(i => i.offsetParent !== null).map(i => i.placeholder).slice(0, 5);
-                const monacoRows = document.querySelectorAll('.monaco-list-row').length;
-                const allSpanCount = [...document.querySelectorAll('span')].filter(s => s.offsetParent !== null && s.textContent.length > 3).length;
-                debug = { allRoles: allRoles.slice(0, 10), visibleInputs, monacoRows, visibleSpanCount: allSpanCount };
-            }
-            
-            return { found: true, success: true, chats, debug };
-        } catch(e) {
-            return { found: false, error: e.toString() };
-        }
-    })()`;
-
-    // Phase 1: Click the history button in the cascade iframe context
-    let clicked = false;
-    let cascadeCtxId = null;
     for (const ctx of cdp.contexts) {
         try {
             const res = await cdp.call("Runtime.evaluate", {
@@ -1372,177 +1409,244 @@ async function getChatHistory(cdp) {
                 awaitPromise: true,
                 contextId: ctx.id
             });
-            if (res.result?.value?.clicked) {
-                clicked = true;
-                cascadeCtxId = ctx.id;
-                break;
+            if (res.result?.value?.success) {
+                console.log(`[NEW-CHAT] ✅ Clicked New Chat in context ${ctx.id}:`, res.result.value.method);
+                cachedSnapshotCtxId = null;
+                cachedCascadeCtxId = null;
+                observerInjected = false;
+                return res.result.value;
             }
         } catch (e) { }
     }
 
-    if (!clicked) {
-        return { error: 'History button not found in any context', chats: [] };
-    }
-
-    // Wait for the panel to open
-    await new Promise(r => setTimeout(r, 1500));
-
-    // Phase 2: Scrape from ALL contexts — try cascade context first since panel may open there
-    const contextsToTry = [
-        ...cdp.contexts.filter(c => c.id === cascadeCtxId),
-        ...cdp.contexts.filter(c => c.id !== cascadeCtxId)
-    ];
-
-    let bestResult = null;
-    for (const ctx of contextsToTry) {
-        try {
-            const res = await cdp.call("Runtime.evaluate", {
-                expression: SCRAPE_EXP,
-                returnByValue: true,
-                awaitPromise: true,
-                contextId: ctx.id
-            });
-            if (res.result?.value?.found) {
-                const val = res.result.value;
-                val._contextId = ctx.id;
-                if (val.chats && val.chats.length > 0) {
-                    // Close the panel after scraping
-                    try {
-                        await cdp.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape" });
-                        await cdp.call("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape" });
-                    } catch (e) { }
-                    return val;
-                }
-                if (!bestResult || (val.debug && !bestResult.debug)) bestResult = val;
-            }
-        } catch (e) { }
-    }
-
-    // Close the panel even if we didn't find anything
+    // Fallback: Send Ctrl+L shortcut
     try {
-        await cdp.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape" });
-        await cdp.call("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape" });
-    } catch (e) { }
-
-    return bestResult || { success: true, chats: [], debug: { clicked, panelNotScraped: true } };
+        console.log('[NEW-CHAT] ⌨️ Fallback: Sending Ctrl+L');
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyDown", key: "l", code: "KeyL",
+            modifiers: 2, windowsVirtualKeyCode: 76, nativeVirtualKeyCode: 76
+        });
+        await cdp.call("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "l", code: "KeyL",
+            modifiers: 2, windowsVirtualKeyCode: 76, nativeVirtualKeyCode: 76
+        });
+        cachedSnapshotCtxId = null;
+        cachedCascadeCtxId = null;
+        observerInjected = false;
+        return { success: true, method: 'cdp_shortcut_ctrl_l' };
+    } catch (e) {
+        console.error('[NEW-CHAT] ❌ Shortcut failed:', e.message);
+        return { error: 'Shortcut failed: ' + e.message };
+    }
+}
+// Get Chat History - Smart check if panel open or click to open & scrape
+function getLocalBrainChats() {
+    try {
+        const brainDir = "/home/absolut7/.gemini/antigravity-ide/brain";
+        if (!fs.existsSync(brainDir)) return [];
+        const entries = fs.readdirSync(brainDir, { withFileTypes: true });
+        const chats = [];
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        for (const entry of entries) {
+            if (!entry.isDirectory() || !uuidRegex.test(entry.name)) continue;
+            const logPath = join(brainDir, entry.name, ".system_generated", "logs", "transcript.jsonl");
+            let title = entry.name;
+            let mtime = 0;
+            try {
+                const stat = fs.statSync(join(brainDir, entry.name));
+                mtime = stat.mtimeMs;
+                if (fs.existsSync(logPath)) {
+                    const line = fs.readFileSync(logPath, "utf8").split("\n")[0];
+                    if (line) {
+                        const parsed = JSON.parse(line);
+                        if (parsed.content) {
+                            title = parsed.content.slice(0, 60).replace(/\n/g, " ");
+                        }
+                    }
+                }
+            } catch (e) {}
+            chats.push({ id: entry.name, title, mtime, date: "Recent" });
+        }
+        chats.sort((a, b) => b.mtime - a.mtime);
+        return chats.slice(0, 30);
+    } catch (e) {
+        return [];
+    }
 }
 
-async function selectChat(cdp, chatTitle) {
-    const safeChatTitle = JSON.stringify(chatTitle);
+async function getChatHistory(cdp) {
+    if (!cdp) return { success: true, count: 0, chats: getLocalBrainChats() };
 
-    const EXP = `(async () => {
-    try {
-        const targetTitle = ${safeChatTitle};
-
-        // First, we need to open the history panel
-        // Find the history button at the top (next to + button)
-        const allButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
-
-        let historyBtn = null;
-
-        // Find by icon type
-        for (const btn of allButtons) {
-            if (btn.offsetParent === null) continue;
-            const hasHistoryIcon = btn.querySelector('svg.lucide-clock') ||
-                btn.querySelector('svg.lucide-history') ||
-                btn.querySelector('svg.lucide-folder') ||
-                btn.querySelector('svg.lucide-clock-rotate-left');
-            if (hasHistoryIcon) {
-                historyBtn = btn;
-                break;
-            }
-        }
-
-        // Fallback: Find by position (second button at top)
-        if (!historyBtn) {
-            const topButtons = allButtons.filter(btn => {
-                if (btn.offsetParent === null) return false;
-                const rect = btn.getBoundingClientRect();
-                return rect.top < 100 && rect.top > 0;
-            }).sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-
-            if (topButtons.length >= 2) {
-                historyBtn = topButtons[1];
-            }
-        }
-
-        if (historyBtn) {
-            historyBtn.click();
-            await new Promise(r => setTimeout(r, 600));
-        }
-
-        // Now find the chat by title in the opened panel
-        await new Promise(r => setTimeout(r, 200));
-
-        const allElements = Array.from(document.querySelectorAll('*'));
-
-        // Find elements matching the title
-        const candidates = allElements.filter(el => {
-            if (el.offsetParent === null) return false;
-            const text = el.innerText?.trim();
-            return text && text.startsWith(targetTitle.substring(0, Math.min(30, targetTitle.length)));
-        });
-
-        // Find the most specific (deepest) visible element with the title
-        let target = null;
-        let maxDepth = -1;
-
-        for (const el of candidates) {
-            // Skip if it has too many children (likely a container)
-            if (el.children.length > 5) continue;
-
-            let depth = 0;
-            let parent = el;
-            while (parent) {
-                depth++;
-                parent = parent.parentElement;
-            }
-
-            if (depth > maxDepth) {
-                maxDepth = depth;
-                target = el;
-            }
-        }
-
-        if (target) {
-            // Find clickable parent if needed
-            let clickable = target;
-            for (let i = 0; i < 5; i++) {
-                if (!clickable) break;
-                const style = window.getComputedStyle(clickable);
-                if (style.cursor === 'pointer' || clickable.tagName === 'BUTTON') {
-                    break;
+    const SCRAPE_EXP = `(async () => {
+        try {
+            let items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
+            let opened = false;
+            if (items.length === 0) {
+                const btn = document.querySelector('a[data-tooltip-id="history-tooltip"]') ||
+                            document.querySelector('[data-past-conversations-toggle="true"]');
+                if (btn) {
+                    btn.click();
+                    opened = true;
+                    await new Promise(r => setTimeout(r, 600));
+                    items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
                 }
-                clickable = clickable.parentElement;
             }
 
-            if (clickable) {
-                clickable.click();
-                return { success: true, method: 'clickable_parent' };
+            // If "Show more" is present, click it to get all
+            const showMore = document.querySelector('[id^="fastpick-show-more"]');
+            if (showMore) {
+                showMore.click();
+                await new Promise(r => setTimeout(r, 300));
+                items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
             }
 
-            target.click();
-            return { success: true, method: 'direct_click' };
+            const chats = items.map(el => {
+                const id = el.id.replace("fastpick-item-", "");
+                const isSelected = el.getAttribute("aria-selected") === "true";
+                const lines = (el.innerText || "").split("\\n").map(l => l.trim()).filter(Boolean);
+                const title = lines[0] || "Untitled Conversation";
+                let date = "Recent";
+                let workspace = "";
+                if (lines.length >= 3) {
+                    workspace = lines[1];
+                    date = lines[2];
+                } else if (lines.length === 2) {
+                    date = lines[1];
+                }
+                return { id, title, workspace, date, isSelected };
+            });
+
+            if (opened) {
+                window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27 }));
+            }
+
+            return { success: true, count: chats.length, chats, opened };
+        } catch(e) {
+            return { success: false, error: e.toString(), chats: [] };
         }
-
-        return { error: 'Chat not found: ' + targetTitle };
-    } catch (e) {
-        return { error: e.toString() };
-    }
-})()`;
+    })()`;
 
     for (const ctx of cdp.contexts) {
         try {
-            const res = await cdp.call("Runtime.evaluate", {
-                expression: EXP,
-                returnByValue: true,
-                awaitPromise: true,
-                contextId: ctx.id
-            });
-            if (res.result?.value) return res.result.value;
+            const res = await Promise.race([
+                cdp.call("Runtime.evaluate", {
+                    expression: SCRAPE_EXP,
+                    returnByValue: true,
+                    awaitPromise: true,
+                    contextId: ctx.id
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3500))
+            ]);
+            if (res.result?.value?.chats?.length > 0) {
+                try {
+                    await cdp.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", keyCode: 27 });
+                    await cdp.call("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", keyCode: 27 });
+                } catch (e) { }
+                return res.result.value;
+            }
         } catch (e) { }
     }
-    return { error: 'Context failed' };
+
+    const localChats = getLocalBrainChats();
+    return { success: true, count: localChats.length, chats: localChats };
+}
+
+async function selectChat(cdp, { id, title } = {}) {
+    if (!cdp) return { error: "CDP disconnected" };
+    const safeId = JSON.stringify(id || "");
+    const safeTitle = JSON.stringify(title || "");
+
+    const EXP = `(async () => {
+        try {
+            const targetId = ${safeId};
+            const targetTitle = ${safeTitle};
+
+            let items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
+            if (items.length === 0) {
+                const historyBtn = document.querySelector('a[data-tooltip-id="history-tooltip"]') ||
+                                 document.querySelector('[data-past-conversations-toggle="true"]');
+                if (historyBtn) {
+                    historyBtn.click();
+                    await new Promise(r => setTimeout(r, 600));
+                    items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
+                }
+            }
+
+            let el = null;
+            if (targetId) {
+                el = document.getElementById("fastpick-item-" + targetId);
+            }
+            if (!el && targetTitle) {
+                const clean = targetTitle.toLowerCase().trim();
+                el = items.find(item => (item.innerText || "").toLowerCase().includes(clean));
+            }
+
+            if (!el) {
+                const showMore = document.querySelector('[id^="fastpick-show-more"]');
+                if (showMore) {
+                    showMore.click();
+                    await new Promise(r => setTimeout(r, 350));
+                    items = Array.from(document.querySelectorAll('div[id^="fastpick-item-"]'));
+                    if (targetId) el = document.getElementById("fastpick-item-" + targetId);
+                    if (!el && targetTitle) {
+                        const clean = targetTitle.toLowerCase().trim();
+                        el = items.find(item => (item.innerText || "").toLowerCase().includes(clean));
+                    }
+                }
+            }
+
+            if (!el) return { success: false, error: "Conversation not found in history list" };
+
+            el.click();
+            try {
+                el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
+                el.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window }));
+            } catch (e) {}
+
+            return { success: true, id: targetId, title: targetTitle };
+        } catch (e) {
+            return { success: false, error: e.toString() };
+        }
+    })()`;
+
+    for (const ctx of cdp.contexts) {
+        try {
+            const res = await Promise.race([
+                cdp.call("Runtime.evaluate", {
+                    expression: EXP,
+                    returnByValue: true,
+                    awaitPromise: true,
+                    contextId: ctx.id
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000))
+            ]);
+            if (res.result?.value?.success) {
+                console.log(`[SELECT-CHAT] ✅ Selected "${title || id}" in context ${ctx.id}`);
+                cachedSnapshotCtxId = null;
+                cachedCascadeCtxId = null;
+                lastSnapshot = null;
+                lastLightCheck = null;
+                observerInjected = false;
+                setTimeout(async () => {
+                    try {
+                        await cdp.call("Runtime.evaluate", {
+                            expression: `(() => {
+                                const ed = document.querySelector(\'[data-lexical-editor="true"]\') || document.querySelector(\'div[contenteditable="true"]\') || document.querySelector(\'textarea\');
+                                if (ed) ed.focus();
+                            })()`, contextId: ctx.id
+                        });
+                    } catch (e) {}
+                }, 400);
+                if (globalWss) {
+                    setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 300);
+                    setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 900);
+                }
+                return res.result.value;
+            }
+        } catch (e) { }
+    }
+    return { error: "Failed to select chat in any context" };
 }
 
 // Check if a chat is currently open (has cascade element)
@@ -1591,22 +1695,24 @@ async function getAppState(cdp) {
             state.mode = modeTexts[0];
         }
 
-        // 2. Get Model (Gemini, Claude, GPT)
-        // Strategy: Only scan buttons that could be model selectors (usually header)
-        // rather than the whole document.
-        const KNOWN_MODELS = ["Gemini", "Claude", "GPT"];
-        const headerButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
-        
-        for (const btn of headerButtons) {
-            const txt = btn.textContent || '';
-            if (KNOWN_MODELS.some(k => txt.includes(k))) {
-                // Must have a chevron or be a likely model button
-                if (btn.querySelector('svg[class*="chevron"]') ||
-                    btn.querySelector('svg.lucide-chevron-up') ||
-                    btn.querySelector('svg.lucide-chevron-down') ||
-                    btn.closest('header')) {
-                    state.model = txt.trim();
-                    break;
+        // 2. Get Model
+        const trigger = document.querySelector('[data-testid="model-selector-trigger"], [data-tooltip-id*="model"]');
+        if (trigger) {
+            state.model = trigger.innerText?.trim() || 'Unknown';
+        } else {
+            const KNOWN_MODELS = ["Gemini", "Claude", "GPT", "DeepSeek"];
+            const headerButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
+            for (const btn of headerButtons) {
+                const txt = btn.innerText?.trim() || '';
+                if (KNOWN_MODELS.some(k => txt.includes(k))) {
+                    if (btn.querySelector('svg[class*="chevron"]') ||
+                        btn.querySelector('svg.lucide-chevron-up') ||
+                        btn.querySelector('svg.lucide-chevron-down') ||
+                        btn.querySelector('svg') ||
+                        btn.closest('header')) {
+                        state.model = txt;
+                        break;
+                    }
                 }
             }
         }
@@ -1682,29 +1788,27 @@ async function initCDP() {
 
 // Inject MutationObserver into the IDE page — pushes DOM changes to server via binding
 async function injectObserver(cdp) {
-    if (observerInjected) return true;
-    if (!cdp || cdp.contexts.length === 0) return false;
+    if (!cdp || !cdp.contexts || cdp.contexts.length === 0) return false;
 
     const INJECT_SCRIPT = `(function() {
-        if (window.__agObserverActive) return 'already_active';
+        if (window.__agObserverDisconnect) {
+            try { window.__agObserverDisconnect(); } catch (e) {}
+        }
 
         const cascade = document.getElementById('conversation') || document.getElementById('chat') || document.getElementById('cascade');
         if (!cascade) return 'no_container';
 
-        // Debounce timer
         let debounceTimer = null;
-        const DEBOUNCE_MS = 500;
+        const DEBOUNCE_MS = 300;
 
-        // LIGHTWEIGHT: Only sends a tiny signal — no DOM cloning on the IDE thread
         function pushSignal() {
             try {
-                window.agPushSnapshot(JSON.stringify({ changed: true, t: Date.now() }));
-            } catch (err) {
-                // Silently fail — don't crash the IDE
-            }
+                if (typeof window.agPushSnapshot === 'function') {
+                    window.agPushSnapshot(JSON.stringify({ changed: true, t: Date.now() }));
+                }
+            } catch (err) {}
         }
 
-        // MutationObserver — fires on any DOM change in the chat
         const observer = new MutationObserver(() => {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(pushSignal, DEBOUNCE_MS);
@@ -1717,37 +1821,39 @@ async function injectObserver(cdp) {
         });
 
         window.__agObserverActive = true;
-        window.__agObserverDisconnect = () => { observer.disconnect(); window.__agObserverActive = false; };
+        window.__agObserverDisconnect = () => {
+            try { observer.disconnect(); } catch (e) {}
+            window.__agObserverActive = false;
+        };
 
-        // Push an initial signal immediately
-        setTimeout(pushSignal, 100);
-
+        setTimeout(pushSignal, 50);
         return 'injected';
     })()`;
 
-    // Find the right context to inject into
-    let targetCtxId = cachedSnapshotCtxId;
+    const sortedContexts = [...cdp.contexts].sort((a, b) => {
+        const aDef = (a.auxData?.isDefault || a.id === 1) ? 1 : 0;
+        const bDef = (b.auxData?.isDefault || b.id === 1) ? 1 : 0;
+        return bDef - aDef;
+    });
 
-    if (!targetCtxId || !cdp.contexts.some(c => c.id === targetCtxId)) {
-        // Scan for the correct context using a lightweight probe
-        for (const ctx of cdp.contexts) {
-            try {
-                const probe = await cdp.call("Runtime.evaluate", {
-                    expression: `!!(document.getElementById('conversation') || document.getElementById('chat') || document.getElementById('cascade'))`,
-                    returnByValue: true,
-                    contextId: ctx.id
-                });
-                if (probe.result?.value === true) {
-                    targetCtxId = ctx.id;
-                    cachedSnapshotCtxId = ctx.id;
-                    break;
-                }
-            } catch (e) { }
-        }
+    let targetCtxId = null;
+    for (const ctx of sortedContexts) {
+        try {
+            const probe = await cdp.call("Runtime.evaluate", {
+                expression: "!!(document.getElementById('conversation') || document.getElementById('chat') || document.getElementById('cascade'))",
+                returnByValue: true,
+                contextId: ctx.id
+            });
+            if (probe.result?.value === true) {
+                targetCtxId = ctx.id;
+                cachedSnapshotCtxId = ctx.id;
+                break;
+            }
+        } catch (e) { }
     }
 
     if (!targetCtxId) {
-        console.log('⏳ No chat container found for observer injection (IDE may still be loading)');
+        console.log('⏳ No chat container found for observer injection');
         return false;
     }
 
@@ -1761,10 +1867,7 @@ async function injectObserver(cdp) {
         const result = res.result?.value;
         if (result === 'injected') {
             observerInjected = true;
-            console.log('👁️  MutationObserver injected — push mode active');
-            return true;
-        } else if (result === 'already_active') {
-            observerInjected = true;
+            console.log(`👁️  MutationObserver injected in context ${targetCtxId} — push mode active`);
             return true;
         } else {
             console.log(`⏳ Observer injection returned: ${result}`);
@@ -1790,66 +1893,62 @@ function broadcastSnapshotUpdate(wss) {
 
 // Background health-check loop (replaces heavy polling)
 // Only handles: CDP reconnection, observer injection, rare fallback snapshots
+// Wire up push handler on CDP connection
+function wirePushHandler(wss) {
+    if (!cdpConnection) return;
+    cdpConnection.onPush = (payload) => {
+        lastPushTime = Date.now();
+        if (!payload.changed) return;
+
+        const now = Date.now();
+        const elapsed = now - lastPushFetchTime;
+
+        if (elapsed >= PUSH_FETCH_THROTTLE) {
+            fetchAndBroadcastSnapshot(wss || globalWss);
+        } else if (!pendingPushFetch) {
+            pendingPushFetch = true;
+            const delay = PUSH_FETCH_THROTTLE - elapsed;
+            setTimeout(() => {
+                pendingPushFetch = false;
+                fetchAndBroadcastSnapshot(wss || globalWss);
+            }, delay);
+        }
+    };
+}
+
+// Server-side snapshot fetch (runs via CDP, not in-page)
+async function fetchAndBroadcastSnapshot(wss) {
+    const targetWss = wss || globalWss;
+    if (!cdpConnection || !targetWss) return;
+    lastPushFetchTime = Date.now();
+    lastPushTime = Date.now();
+    try {
+        const snapshot = await Promise.race([
+            captureSnapshot(cdpConnection),
+            new Promise(resolve => setTimeout(() => resolve(null), 8000))
+        ]);
+        if (snapshot && snapshot !== '__unchanged__' && !snapshot.error) {
+            const hash = hashString(snapshot.html);
+            if (hash !== lastSnapshotHash) {
+                lastSnapshot = snapshot;
+                lastSnapshotHash = hash;
+                broadcastSnapshotUpdate(targetWss);
+                console.log(`📡 Snapshot update broadcast (hash: ${hash})`);
+            }
+        }
+    } catch (e) {
+        console.error('Snapshot broadcast error:', e.message);
+    }
+}
+
+// Background health-check loop
 async function startBackgroundLoop(wss) {
     let isConnecting = false;
 
-    // Wire up the push handler on the CDP connection
-    // Now receives lightweight "changed" signals and fetches snapshot server-side
-    function wirePushHandler() {
-        if (!cdpConnection) return;
-        cdpConnection.onPush = (payload) => {
-            lastPushTime = Date.now();
-
-            // payload is now just { changed: true, t: ... } — a lightweight signal
-            if (!payload.changed) return;
-
-            const now = Date.now();
-            const elapsed = now - lastPushFetchTime;
-
-            if (elapsed >= PUSH_FETCH_THROTTLE) {
-                // Enough time has passed — fetch immediately
-                fetchAndBroadcastSnapshot(wss);
-            } else if (!pendingPushFetch) {
-                // Schedule a fetch after the throttle window
-                pendingPushFetch = true;
-                const delay = PUSH_FETCH_THROTTLE - elapsed;
-                setTimeout(() => {
-                    pendingPushFetch = false;
-                    fetchAndBroadcastSnapshot(wss);
-                }, delay);
-            }
-            // else: a fetch is already scheduled, skip
-        };
-    }
-
-    // Server-side snapshot fetch (runs via CDP, not in-page)
-    async function fetchAndBroadcastSnapshot(wss) {
-        if (!cdpConnection) return;
-        lastPushFetchTime = Date.now();
-        try {
-            const snapshot = await Promise.race([
-                captureSnapshot(cdpConnection),
-                new Promise(resolve => setTimeout(() => resolve(null), 8000)) // 8s timeout (was 3s, but large DOM eval takes longer under heavy terminal load)
-            ]);
-            if (snapshot && snapshot !== '__unchanged__' && !snapshot.error) {
-                const hash = hashString(snapshot.html);
-                if (hash !== lastSnapshotHash) {
-                    lastSnapshot = snapshot;
-                    lastSnapshotHash = hash;
-                    broadcastSnapshotUpdate(wss);
-                    console.log(`📡 Push-triggered snapshot (hash: ${hash})`);
-                }
-            }
-        } catch (e) {
-            console.error('Push-triggered snapshot error:', e.message);
-        }
-    }
-
     // Initial wiring
-    wirePushHandler();
+    wirePushHandler(wss);
 
     const healthCheck = async () => {
-        // --- 1. CDP Connection Health ---
         if (!cdpConnection || (cdpConnection.ws && cdpConnection.ws.readyState !== WebSocket.OPEN)) {
             if (!isConnecting) {
                 console.log('🔍 Looking for Antigravity CDP connection...');
@@ -1866,17 +1965,16 @@ async function startBackgroundLoop(wss) {
                     console.log(`✅ CDP Connection established (after ${reconnectAttempts} attempts)`);
                     isConnecting = false;
                     reconnectAttempts = 0;
-                    wirePushHandler();
+                    wirePushHandler(wss);
+                    injectObserver(cdpConnection).catch(() => {});
                 }
-            } catch (err) { /* wait for next cycle */ }
-            // Exponential backoff: 3s -> 6s -> 12s -> 24s -> cap at 30s
+            } catch (err) { }
             reconnectAttempts++;
             const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts - 1), RECONNECT_MAX_MS);
             setTimeout(healthCheck, delay);
             return;
         }
 
-        // --- 2. Observer Injection ---
         if (!observerInjected) {
             try {
                 await injectObserver(cdpConnection);
@@ -1885,7 +1983,6 @@ async function startBackgroundLoop(wss) {
             }
         }
 
-        // --- 3. CSS Cache Refresh (infrequent, lightweight) ---
         const now = Date.now();
         if (!cachedCSS || (now - lastCSSRefresh) > CSS_CACHE_TTL) {
             try {
@@ -1899,49 +1996,27 @@ async function startBackgroundLoop(wss) {
                     if (cssRes.result?.value) {
                         cachedCSS = cssRes.result.value;
                         lastCSSRefresh = now;
-                        // Update existing snapshot CSS if we have one
                         if (lastSnapshot) {
                             lastSnapshot.css = cachedCSS;
                             if (lastSnapshot.stats) lastSnapshot.stats.cssSize = cachedCSS.length;
                         }
                     }
                 }
-            } catch (e) { /* keep old cache */ }
+            } catch (e) { }
         }
 
-        // --- 4. Fallback: if no push received in 30s and clients connected, do ONE snapshot ---
         const hasClients = wss.clients.size > 0;
-        if (hasClients && (now - lastPushTime) > FALLBACK_SNAPSHOT_INTERVAL && observerInjected) {
-            console.log('⚡ Fallback snapshot (no push received in 30s)');
-            try {
-                const snapshot = await Promise.race([
-                    captureSnapshot(cdpConnection),
-                    new Promise(resolve => setTimeout(() => resolve(null), 6000))
-                ]);
-                if (snapshot && snapshot !== '__unchanged__' && !snapshot.error) {
-                    const hash = hashString(snapshot.html);
-                    if (hash !== lastSnapshotHash) {
-                        lastSnapshot = snapshot;
-                        lastSnapshotHash = hash;
-                        broadcastSnapshotUpdate(wss);
-                        console.log(`📸 Fallback snapshot updated (hash: ${hash})`);
-                    }
-                }
-                lastPushTime = now; // Reset timer even if unchanged
-            } catch (e) {
-                console.error('Fallback snapshot error:', e.message);
-            }
+        if (hasClients && (now - lastPushTime) > FALLBACK_SNAPSHOT_INTERVAL) {
+            await fetchAndBroadcastSnapshot(wss);
+            lastPushTime = now;
         }
-
-        // Queue processing moved to independent startQueueDrainLoop (5s interval)
 
         setTimeout(healthCheck, HEALTH_CHECK_INTERVAL);
     };
 
     healthCheck();
 
-    // --- Independent queue drain loop (5s) ---
-    // Separated from healthCheck so queued messages don't wait 30s
+    // --- Independent queue drain loop (2s) ---
     function startQueueDrainLoop() {
         setInterval(async () => {
             if (messageQueue.length === 0 || isProcessingQueue) return;
@@ -1949,35 +2024,158 @@ async function startBackgroundLoop(wss) {
 
             isProcessingQueue = true;
             try {
-                // Lightweight busy check (<1.5s) instead of full injectMessage (12s)
                 const busy = await isAgentBusy(cdpConnection);
                 if (busy) {
-                    // Still busy — drop stale messages (>5 min old)
-                    const age = Math.round((Date.now() - messageQueue[0].timestamp) / 1000);
-                    if (age > 300) {
-                        const dropped = messageQueue.shift();
-                        console.log(`🗑️ Dropped stale queued message (${age}s old): "${dropped.text.substring(0, 40)}..."`);
+                    const now = Date.now();
+                    const staleIdx = messageQueue.findIndex(m => (now - m.timestamp) > 900000);
+                    if (staleIdx !== -1) {
+                        const dropped = messageQueue.splice(staleIdx, 1)[0];
+                        console.log(`🗑️ Dropped stale queued message: "${dropped.text.substring(0, 40)}..."`);
+                        broadcastQueueUpdate(globalWss);
                     }
                     return;
                 }
-                // Agent is idle — send the queued message
-                const result = await injectMessage(cdpConnection, messageQueue[0].text);
+
+                const current = messageQueue[0];
+                console.log(`🚀 Queue: Sending message "${current.text.substring(0, 40)}..." (attempt ${(current.attempts || 0) + 1}/3)`);
+
+                const result = await injectMessage(cdpConnection, current.text);
                 if (result.reason === 'busy') {
-                    // Race condition: became busy between check and inject — leave in queue
                     return;
                 }
-                const sent = messageQueue.shift();
-                console.log(`✅ Queue: sent message "${sent.text.substring(0, 40)}..." (${messageQueue.length} remaining)`);
-                setTimeout(() => fetchAndBroadcastSnapshot(wss), 1000);
+
+                if (result.ok !== false) {
+                    messageQueue.shift();
+                    console.log(`✅ Queue: Sent message successfully! (${messageQueue.length} remaining)`);
+                    broadcastQueueUpdate(globalWss);
+                    if (globalWss) {
+                        setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 300);
+                        setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 1200);
+                        setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 2500);
+                    }
+                } else {
+                    current.attempts = (current.attempts || 0) + 1;
+                    console.warn(`⚠️ Queue: Injection attempt ${current.attempts}/5 failed: ${result.error || 'unknown'}`);
+                    if (current.attempts >= 5) {
+                        messageQueue.shift();
+                        console.error(`❌ Queue: Message dropped after 5 failed attempts: "${current.text.substring(0, 40)}..."`);
+                        broadcastQueueUpdate(globalWss);
+                    }
+                }
             } catch (e) {
                 console.error('Queue drain error:', e.message);
             } finally {
-                isProcessingQueue = false; // Always reset — never gets stuck
+                isProcessingQueue = false;
             }
-        }, 5000); // Check every 5 seconds
+        }, 1200);
     }
 
     startQueueDrainLoop();
+}
+
+
+// --- Workspace Management ---
+function getAvailableWorkspaces() {
+    const baseDocs = "/home/absolut7/Documents";
+    const workspaces = [];
+    const seenPaths = new Set();
+
+    // 1. Scan ~/Documents direct subfolders
+    try {
+        if (fs.existsSync(baseDocs)) {
+            const entries = fs.readdirSync(baseDocs, { withFileTypes: true });
+            for (const ent of entries) {
+                if (ent.isDirectory() && !ent.name.startsWith(".") && ent.name !== "node_modules") {
+                    const fullPath = join(baseDocs, ent.name);
+                    seenPaths.add(fullPath);
+                    let mtime = 0;
+                    try { mtime = fs.statSync(fullPath).mtimeMs; } catch (e) {}
+                    workspaces.push({
+                        name: ent.name,
+                        shortName: ent.name,
+                        path: fullPath,
+                        group: "Documents",
+                        mtime
+                    });
+                }
+            }
+        }
+    } catch (e) {}
+
+    // 2. Scan ~/Documents/26apps subfolders
+    const apps26 = join(baseDocs, "26apps");
+    try {
+        if (fs.existsSync(apps26)) {
+            const entries = fs.readdirSync(apps26, { withFileTypes: true });
+            for (const ent of entries) {
+                if (ent.isDirectory() && !ent.name.startsWith(".") && ent.name !== "node_modules") {
+                    const fullPath = join(apps26, ent.name);
+                    if (!seenPaths.has(fullPath)) {
+                        seenPaths.add(fullPath);
+                        let mtime = 0;
+                        try { mtime = fs.statSync(fullPath).mtimeMs; } catch (e) {}
+                        workspaces.push({
+                            name: "26apps / " + ent.name,
+                            shortName: ent.name,
+                            path: fullPath,
+                            group: "26apps",
+                            mtime
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {}
+
+    // Sort by modification time (most recent first)
+    workspaces.sort((a, b) => b.mtime - a.mtime);
+
+    // Current workspace detection
+    let currentWorkspace = { name: "news", path: "/home/absolut7/Documents/news" };
+    try {
+        if (lastSnapshot && lastSnapshot.workspaceTitle) {
+            const match = workspaces.find(w => w.name.toLowerCase() === lastSnapshot.workspaceTitle.toLowerCase() || (w.shortName && w.shortName.toLowerCase() === lastSnapshot.workspaceTitle.toLowerCase()) || lastSnapshot.workspaceTitle.toLowerCase().includes(w.name.toLowerCase()));
+            if (match) currentWorkspace = match;
+            else currentWorkspace = { name: lastSnapshot.workspaceTitle, path: join(baseDocs, lastSnapshot.workspaceTitle) };
+        }
+    } catch (e) {}
+
+    return {
+        currentWorkspace,
+        parentDir: baseDocs,
+        workspaces
+    };
+}
+
+async function openWorkspaceFolder(folderPath) {
+    if (!folderPath) return { error: "Folder path required" };
+    const baseDocs = "/home/absolut7/Documents";
+    const resolvedPath = folderPath.startsWith("/") ? folderPath : join(baseDocs, folderPath);
+    if (!fs.existsSync(resolvedPath)) {
+        fs.mkdirSync(resolvedPath, { recursive: true });
+    }
+
+    console.log("[WORKSPACE] 📂 Opening folder:", resolvedPath);
+    try {
+        const { exec } = require("child_process");
+        exec(`/home/absolut7/.local/share/antigravity/bin/antigravity -r "${resolvedPath}"`, (err) => {
+            if (err) console.warn("[WORKSPACE] antigravity -r:", err.message);
+        });
+    } catch (e) {
+        console.error("[WORKSPACE] Failed to open folder:", e.message);
+    }
+
+    await new Promise(r => setTimeout(r, 1800));
+    cachedSnapshotCtxId = null;
+    cachedCascadeCtxId = null;
+    observerInjected = false;
+    await ensureCDP();
+
+    return {
+        success: true,
+        path: resolvedPath,
+        name: basename(resolvedPath)
+    };
 }
 
 // Create Express app
@@ -2004,6 +2202,7 @@ async function createServer() {
     }
 
     const wss = new WebSocketServer({ server });
+    globalWss = wss;
 
     // Initialize Auth Token (wait for hashString to be available)
     AUTH_TOKEN = hashString(APP_PASSWORD + 'antigravity_salt');
@@ -2166,80 +2365,118 @@ async function createServer() {
         res.json(result);
     });
 
-    // Upload Image (attach picture to IDE chat)
-    app.post('/upload-image', async (req, res) => {
+    // Upload File or Image (attach document, code, data, or picture to IDE chat)
+    const handleFileUpload = async (req, res) => {
         const { name, dataUrl } = req.body;
-        if (!dataUrl) return res.status(400).json({ error: 'No image data' });
-        if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: 'CDP disconnected' });
+        if (!dataUrl) return res.status(400).json({ error: 'No file data' });
 
         try {
-            // Decode base64 and save to temp file
-            const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
-            if (!matches) return res.status(400).json({ error: 'Invalid data URL' });
+            // Decode base64 data URL (handles data:<mime>;base64,<content> or raw base64)
+            let buffer;
+            let mime = '';
+            const matches = dataUrl.match(/^data:([^;]*);base64,(.+)$/);
+            if (matches) {
+                mime = matches[1] || 'application/octet-stream';
+                buffer = Buffer.from(matches[2], 'base64');
+            } else {
+                buffer = Buffer.from(dataUrl, 'base64');
+            }
 
-            const ext = matches[1].split('/')[1] || 'png';
-            const buffer = Buffer.from(matches[2], 'base64');
-            const tmpPath = join(os.tmpdir(), `antigravity_upload_${Date.now()}.${ext}`);
+            // Sanitize file name and preserve extension
+            let safeName = '';
+            if (name && typeof name === 'string') {
+                safeName = basename(name).replace(/[^a-zA-Z0-9._-]/g, '_');
+            }
+
+            let fileName = '';
+            if (safeName && safeName.length > 0) {
+                fileName = `antigravity_upload_${Date.now()}_${safeName}`;
+            } else {
+                let ext = 'bin';
+                if (mime.startsWith('image/')) {
+                    ext = (mime.split('/')[1] || 'png').split('+')[0];
+                } else if (mime.includes('/')) {
+                    const sub = mime.split('/')[1];
+                    if (sub && sub.length <= 6) ext = sub;
+                }
+                fileName = `antigravity_upload_${Date.now()}.${ext}`;
+            }
+
+            const tmpPath = join(os.tmpdir(), fileName);
             fs.writeFileSync(tmpPath, buffer);
 
-            console.log(`[UPLOAD] Saved image to ${tmpPath} (${buffer.length} bytes)`);
+            console.log(`[UPLOAD] Saved file to ${tmpPath} (${buffer.length} bytes, name: ${safeName || fileName})`);
 
-            // Use CDP to inject the file into the IDE's file input
-            // First, find the file input in the IDE
-            const contexts = cdpConnection.contexts || [];
+            // Use CDP if available to also inject into IDE file input if present
             let uploaded = false;
-
-            for (const ctx of contexts) {
-                try {
-                    // Find file input element
-                    const evalRes = await cdpConnection.call('Runtime.evaluate', {
-                        expression: 'document.querySelector("input[type=file]")',
-                        contextId: ctx.id
-                    });
-
-                    if (evalRes.result && evalRes.result.objectId && evalRes.result.subtype !== 'null') {
-                        // Get nodeId from the object
-                        const nodeRes = await cdpConnection.call('DOM.requestNode', {
-                            objectId: evalRes.result.objectId
+            if (cdpConnection || (await ensureCDP())) {
+                const contexts = cdpConnection ? (cdpConnection.contexts || []) : [];
+                for (const ctx of contexts) {
+                    try {
+                        const evalRes = await cdpConnection.call('Runtime.evaluate', {
+                            expression: 'document.querySelector("input[type=file]")',
+                            contextId: ctx.id
                         });
 
-                        // Set the file
-                        await cdpConnection.call('DOM.setFileInputFiles', {
-                            nodeId: nodeRes.nodeId,
-                            files: [tmpPath]
-                        });
+                        if (evalRes.result && evalRes.result.objectId && evalRes.result.subtype !== 'null') {
+                            const nodeRes = await cdpConnection.call('DOM.requestNode', {
+                                objectId: evalRes.result.objectId
+                            });
 
-                        console.log(`[UPLOAD] Injected file into IDE context ${ctx.id}`);
-                        uploaded = true;
-                        break;
-                    }
-                } catch (ctxErr) {
-                    // Context might not have DOM access
+                            await cdpConnection.call('DOM.setFileInputFiles', {
+                                nodeId: nodeRes.nodeId,
+                                files: [tmpPath]
+                            });
+
+                            console.log(`[UPLOAD] Injected file into IDE context ${ctx.id}`);
+                            uploaded = true;
+                            break;
+                        }
+                    } catch (ctxErr) {}
                 }
             }
 
-            if (uploaded) {
-                res.json({ success: true, path: tmpPath });
-            } else {
-                // File saved but couldn't find IDE input - still useful
-                res.json({ success: true, path: tmpPath, note: 'File saved but no file input found in IDE' });
-            }
+            res.json({ success: true, path: tmpPath, name: safeName || fileName, uploadedToIde: uploaded });
         } catch (e) {
             console.error('[UPLOAD] Error:', e);
             res.status(500).json({ error: e.message });
         }
-    });
+    };
 
-    // Stop Generation
+    app.post('/upload-file', handleFileUpload);
+    app.post('/upload-image', handleFileUpload);
+
     app.post('/stop', async (req, res) => {
         if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: 'CDP disconnected' });
         const result = await stopGeneration(cdpConnection);
         res.json(result);
     });
 
+    // Reconnect CDP without restarting IDE
+    app.post("/reconnect-cdp", async (req, res) => {
+        console.log("🔄 Manual CDP Reconnect requested...");
+        try {
+            if (cdpConnection && cdpConnection.ws) {
+                try { cdpConnection.ws.close(); } catch (e) { }
+                cdpConnection = null;
+            }
+            const endpoint = await discoverCDP();
+            cdpConnection = await connectCDP(endpoint.url);
+            if (globalWss) {
+                wirePushHandler(globalWss);
+                injectObserver(cdpConnection).catch(() => {});
+            }
+            console.log("  ✅ Reconnected to CDP on port", endpoint.port);
+            res.json({ success: true, message: "CDP reconnected", port: endpoint.port });
+        } catch (e) {
+            console.error("  ❌ Reconnect CDP failed:", e.message);
+            res.status(500).json({ error: "Failed to reconnect: " + e.message });
+        }
+    });
+
     // Restart IDE - Kill antigravity and restart with debug port
-    app.post('/restart-ide', async (req, res) => {
-        console.log('🔄 Restart IDE requested...');
+    app.post("/restart-ide", async (req, res) => {
+        console.log("🔄 Restart IDE requested...");
         try {
             // Close existing CDP connection first
             if (cdpConnection && cdpConnection.ws) {
@@ -2250,62 +2487,75 @@ async function createServer() {
             // Kill all antigravity processes EXCEPT this server
             const myPid = process.pid;
             try {
-                // pgrep -f antigravity returns PIDs separated by newlines
-                const pids = execSync('pgrep -f "antigravity" || true', { encoding: 'utf8' }).trim().split('\n');
-
-                // Filter out empty strings and our own PID
-                const toKill = pids.filter(pid => pid && pid.trim().length > 0 && pid.trim() !== String(myPid));
+                const psOut = execSync("ps -eo pid,args", { encoding: "utf8" });
+                const lines = psOut.split("\n");
+                const toKill = [];
+                for (const line of lines) {
+                    const match = line.trim().match(/^(\d+)\s+(.+)$/);
+                    if (!match) continue;
+                    const pid = parseInt(match[1], 10);
+                    const cmd = match[2];
+                    if (pid === myPid) continue;
+                    if (cmd.includes("server.js") || cmd.includes("antigravity_phone_chat")) continue;
+                    if (cmd.includes("antigravity-ide") || cmd.includes("language_server_linux") || (cmd.includes("antigravity") && !cmd.includes("gravityremote2"))) {
+                        toKill.push(pid);
+                    }
+                }
 
                 if (toKill.length > 0) {
-                    execSync(`kill ${toKill.join(' ')}`, { stdio: 'pipe' });
-                    console.log(`  ✅ Killed antigravity processes: ${toKill.join(', ')}`);
+                    execSync(`kill ${toKill.join(" ")} || true`, { stdio: "pipe" });
+                    console.log(`  ✅ Killed antigravity processes: ${toKill.join(", ")}`);
                 } else {
-                    console.log('  ⚠️  No other antigravity processes found');
+                    console.log("  ⚠️  No other antigravity processes found");
                 }
             } catch (e) {
-                console.log('  ⚠️  Error killing processes:', e.message);
+                console.log("  ⚠️  Error killing processes:", e.message);
             }
 
             // Wait for processes to die
             await new Promise(r => setTimeout(r, 2000));
 
             // Start antigravity with debug port
-            const child = spawn('antigravity', ['--remote-debugging-port=9222'], {
+            const child = spawn("/home/absolut7/.local/bin/antigravity", ["--remote-debugging-port=9222"], {
                 detached: true,
-                stdio: 'ignore',
-                env: { ...process.env }
+                stdio: "ignore",
+                env: {
+                    ...process.env,
+                    PATH: `/home/absolut7/.local/bin:${process.env.PATH || ""}`,
+                    DISPLAY: process.env.DISPLAY || ":0"
+                }
             });
             child.unref();
-            console.log('  🚀 Started antigravity --remote-debugging-port=9222 (PID:', child.pid, ')');
+            console.log("  🚀 Started antigravity --remote-debugging-port=9222 (PID:", child.pid, ")");
 
-            // Wait for IDE to boot and CDP to become available
-            res.json({ success: true, message: 'IDE restarting...', pid: child.pid });
+            // Respond immediately
+            res.json({ success: true, message: "IDE restarting...", pid: child.pid });
 
-            // Reconnect CDP after IDE boots (in background)
+            // Reconnect CDP after IDE boots
             setTimeout(async () => {
-                for (let attempt = 0; attempt < 15; attempt++) {
+                for (let attempt = 0; attempt < 20; attempt++) {
                     try {
                         const endpoint = await discoverCDP();
                         cdpConnection = await connectCDP(endpoint.url);
-                        console.log('  ✅ CDP reconnected after restart');
+                        console.log("  ✅ CDP reconnected after restart");
                         return;
                     } catch (e) {
-                        console.log(`  ⏳ CDP reconnect attempt ${attempt + 1}/15...`);
-                        await new Promise(r => setTimeout(r, 3000));
+                        console.log(`  ⏳ CDP reconnect attempt ${attempt + 1}/20...`);
+                        await new Promise(r => setTimeout(r, 2000));
                     }
                 }
-                console.error('  ❌ Failed to reconnect CDP after restart');
-            }, 5000);
+                console.error("  ❌ Failed to reconnect CDP after restart");
+            }, 3000);
 
         } catch (e) {
-            console.error('Restart IDE error:', e);
+            console.error("Restart IDE error:", e);
             res.status(500).json({ error: e.message });
         }
     });
 
     // Send message
     app.post('/send', async (req, res) => {
-        const { message } = req.body;
+        const { message, forceQueue, forceSend } = req.body;
 
         if (!message) {
             return res.status(400).json({ error: 'Message required' });
@@ -2315,40 +2565,138 @@ async function createServer() {
             return res.status(503).json({ error: 'CDP not connected' });
         }
 
-        // Timeout the inject so the /send endpoint never hangs
-        const result = await Promise.race([
-            injectMessage(cdpConnection, message),
-            new Promise(resolve => setTimeout(() => resolve({ ok: false, reason: 'endpoint_timeout' }), 10000))
-        ]);
-
-        // If agent is busy (terminal running), queue the message instead of dropping it
-        if (result.reason === 'busy') {
+        if (forceQueue) {
             if (messageQueue.length >= MAX_QUEUED_MESSAGES) {
                 return res.json({
                     success: false,
                     queued: false,
                     reason: 'queue_full',
                     queueSize: messageQueue.length,
-                    details: { error: 'Message queue full (max ' + MAX_QUEUED_MESSAGES + '). Agent is busy.' }
+                    details: { error: 'Message queue full (max ' + MAX_QUEUED_MESSAGES + ').' }
                 });
             }
-            messageQueue.push({ text: message, timestamp: Date.now() });
-            console.log(`📋 Message queued (${messageQueue.length}/${MAX_QUEUED_MESSAGES}): "${message.substring(0, 50)}..."`);
+            const item = {
+                id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+                text: message,
+                timestamp: Date.now(),
+                attempts: 0
+            };
+            messageQueue.push(item);
+            console.log(`📋 Message force-queued (${messageQueue.length}/${MAX_QUEUED_MESSAGES}): "${message.substring(0, 50)}..."`);
+            broadcastQueueUpdate(globalWss);
             return res.json({
                 success: true,
                 queued: true,
                 queuePosition: messageQueue.length,
-                details: { reason: 'Agent busy — message queued for auto-send when idle' }
+                id: item.id,
+                details: { reason: 'Message queued for auto-send' }
             });
         }
 
-        // Always return 200 - the message usually goes through even if CDP reports issues
-        // The client will refresh and see if the message appeared
+        // Attempt direct injection first (works for both active send and IDE native queueing)
+        const result = await Promise.race([
+            injectMessage(cdpConnection, message),
+            new Promise(resolve => setTimeout(() => resolve({ ok: false, reason: 'endpoint_timeout' }), 10000))
+        ]);
+
+        if (result.ok === false && (result.reason === 'busy' || result.reason === 'endpoint_timeout')) {
+            if (messageQueue.length >= MAX_QUEUED_MESSAGES) {
+                return res.json({
+                    success: false,
+                    queued: false,
+                    reason: 'queue_full',
+                    queueSize: messageQueue.length,
+                    details: { error: 'Message queue full (max ' + MAX_QUEUED_MESSAGES + ').' }
+                });
+            }
+            const item = {
+                id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+                text: message,
+                timestamp: Date.now(),
+                attempts: 0
+            };
+            messageQueue.push(item);
+            console.log(`📋 Message queued in fallback (${messageQueue.length}/${MAX_QUEUED_MESSAGES}): "${message.substring(0, 50)}..."`);
+            broadcastQueueUpdate(globalWss);
+            return res.json({
+                success: true,
+                queued: true,
+                queuePosition: messageQueue.length,
+                id: item.id,
+                details: { reason: 'Agent busy — message queued for auto-send when ready' }
+            });
+        }
+
         res.json({
             success: result.ok !== false,
+            queued: false,
             method: result.method || 'attempted',
             details: result
         });
+
+        if (result.ok !== false && globalWss) {
+            setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 300);
+            setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 1200);
+            setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 2500);
+        }
+    });
+
+    // Queue APIs
+    app.get('/api/queue', async (req, res) => {
+        let busy = false;
+        try {
+            if (cdpConnection) busy = await isAgentBusy(cdpConnection);
+        } catch (e) { }
+        res.json({
+            count: messageQueue.length,
+            max: MAX_QUEUED_MESSAGES,
+            isAgentBusy: busy,
+            items: messageQueue.map(m => ({
+                id: m.id,
+                text: m.text,
+                timestamp: m.timestamp,
+                attempts: m.attempts || 0
+            }))
+        });
+    });
+
+    app.post('/api/queue/clear', (req, res) => {
+        const count = messageQueue.length;
+        messageQueue.length = 0;
+        console.log(`🗑️ Manually cleared queue (${count} messages)`);
+        broadcastQueueUpdate(globalWss);
+        res.json({ success: true, cleared: count });
+    });
+
+    app.post('/api/queue/send-now', async (req, res) => {
+        if (messageQueue.length === 0) {
+            return res.json({ success: false, error: 'Queue is empty' });
+        }
+        if (!cdpConnection && !(await ensureCDP())) {
+            return res.status(503).json({ error: 'CDP not connected' });
+        }
+        const item = messageQueue[0];
+        const result = await injectMessage(cdpConnection, item.text);
+        if (result.ok !== false) {
+            messageQueue.shift();
+            broadcastQueueUpdate(globalWss);
+            if (globalWss) {
+                setTimeout(() => fetchAndBroadcastSnapshot(globalWss), 400);
+            }
+            return res.json({ success: true, message: 'Message sent', remaining: messageQueue.length });
+        }
+        res.json({ success: false, error: result.error || result.reason || 'Send failed' });
+    });
+
+    app.post('/api/queue/remove', (req, res) => {
+        const { id } = req.body;
+        const idx = messageQueue.findIndex(m => m.id === id);
+        if (idx !== -1) {
+            const removed = messageQueue.splice(idx, 1)[0];
+            broadcastQueueUpdate(globalWss);
+            return res.json({ success: true, removed });
+        }
+        res.status(404).json({ error: 'Message not found in queue' });
     });
 
     // UI Inspection endpoint - Returns all buttons as JSON for debugging
@@ -2575,7 +2923,7 @@ async function main() {
         await initCDP();
     } catch (err) {
         console.warn(`⚠️  Initial CDP discovery failed: ${err.message}`);
-        console.log('💡 Start Antigravity with --remote-debugging-port=9000 to connect.');
+        console.log('💡 Start Antigravity with --remote-debugging-port=9222 to connect.');
     }
 
     try {
@@ -2687,8 +3035,51 @@ async function main() {
             res.json(result);
         });
 
-        // Start New Chat
+        // Workspace APIs
+        app.get('/api/workspaces', (req, res) => {
+            const data = getAvailableWorkspaces();
+            res.json({ success: true, ...data });
+        });
+
+        app.post('/api/workspaces/create', (req, res) => {
+            const { folderName, parentPath } = req.body;
+            if (!folderName) return res.status(400).json({ error: 'Folder name is required' });
+            const baseDir = parentPath || '/home/absolut7/Documents';
+            const cleanName = folderName.replace(/[^a-zA-Z0-9_-]/g, '_');
+            const targetPath = join(baseDir, cleanName);
+            try {
+                if (!fs.existsSync(targetPath)) {
+                    fs.mkdirSync(targetPath, { recursive: true });
+                }
+                res.json({ success: true, path: targetPath, name: cleanName });
+            } catch (e) {
+                res.status(500).json({ error: e.message });
+            }
+        });
+
+        app.post('/api/workspaces/open', async (req, res) => {
+            const { path: folderPath, startChat } = req.body;
+            if (!folderPath) return res.status(400).json({ error: 'Path is required' });
+            const wsRes = await openWorkspaceFolder(folderPath);
+            if (startChat && cdpConnection) {
+                await new Promise(r => setTimeout(r, 600));
+                await startNewChat(cdpConnection);
+            }
+            res.json(wsRes);
+        });
+
+        // Start New Chat (with optional workspace / folder switching)
         app.post('/new-chat', async (req, res) => {
+            const { folderPath, newFolderName } = req.body || {};
+
+            // If a new folder or workspace folder was chosen, switch to it first
+            if (newFolderName) {
+                const targetPath = join('/home/absolut7/Documents', newFolderName.replace(/[^a-zA-Z0-9_-]/g, '_'));
+                await openWorkspaceFolder(targetPath);
+            } else if (folderPath) {
+                await openWorkspaceFolder(folderPath);
+            }
+
             if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: 'CDP disconnected' });
             const result = await startNewChat(cdpConnection);
 
@@ -2725,10 +3116,10 @@ async function main() {
 
         // Select a Chat
         app.post('/select-chat', async (req, res) => {
-            const { title } = req.body;
-            if (!title) return res.status(400).json({ error: 'Chat title required' });
-            if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: 'CDP disconnected' });
-            const result = await selectChat(cdpConnection, title);
+            const { id, title } = req.body;
+            if (!id && !title) return res.status(400).json({ error: "Chat id or title required" });
+            if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: "CDP disconnected" });
+            const result = await selectChat(cdpConnection, { id, title });
             res.json(result);
         });
 
