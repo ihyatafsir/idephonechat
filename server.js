@@ -892,105 +892,6 @@ async function _injectMessageInner(cdp, text) {
     }
 }
 
-// Set functionality mode (Fast vs Planning)
-async function setMode(cdp, mode) {
-    if (!['Fast', 'Planning'].includes(mode)) return { error: 'Invalid mode' };
-
-    const EXP = `(async () => {
-        try {
-            // STRATEGY: Find the element that IS the current mode indicator.
-            // It will have text 'Fast' or 'Planning'.
-            // It might not be a <button>, could be a <div> with cursor-pointer.
-            
-            // 1. Get all elements with text 'Fast' or 'Planning'
-            const allEls = Array.from(document.querySelectorAll('*'));
-            const candidates = allEls.filter(el => {
-                // Must have single text node child to avoid parents
-                if (el.children.length > 0) return false;
-                const txt = el.textContent.trim();
-                return txt === 'Fast' || txt === 'Planning';
-            });
-
-            // 2. Find the one that looks interactive (cursor-pointer)
-            // Traverse up from text node to find clickable container
-            let modeBtn = null;
-            
-            for (const el of candidates) {
-                let current = el;
-                // Go up max 4 levels
-                for (let i = 0; i < 4; i++) {
-                    if (!current) break;
-                    const style = window.getComputedStyle(current);
-                    if (style.cursor === 'pointer' || current.tagName === 'BUTTON') {
-                        modeBtn = current;
-                        break;
-                    }
-                    current = current.parentElement;
-                }
-                if (modeBtn) break;
-            }
-
-            if (!modeBtn) return { error: 'Mode indicator/button not found' };
-
-            // Check if already set
-            if (modeBtn.innerText.includes('${mode}')) return { success: true, alreadySet: true };
-
-            // 3. Click to open menu
-            modeBtn.click();
-            await new Promise(r => setTimeout(r, 600));
-
-            // 4. Find the dialog
-            let visibleDialog = Array.from(document.querySelectorAll('[role="dialog"]'))
-                                    .find(d => d.offsetHeight > 0 && d.innerText.includes('${mode}'));
-            
-            // Fallback: Just look for any new visible container if role=dialog is missing
-            if (!visibleDialog) {
-                // Maybe it's not role=dialog? Look for a popover-like div
-                 visibleDialog = Array.from(document.querySelectorAll('div'))
-                    .find(d => {
-                        const style = window.getComputedStyle(d);
-                        return d.offsetHeight > 0 && 
-                               (style.position === 'absolute' || style.position === 'fixed') && 
-                               d.innerText.includes('${mode}') &&
-                               !d.innerText.includes('Files With Changes'); // Anti-context menu
-                    });
-            }
-
-            if (!visibleDialog) return { error: 'Dropdown not opened or options not visible' };
-
-            // 5. Click the option
-            const allDialogEls = Array.from(visibleDialog.querySelectorAll('*'));
-            const target = allDialogEls.find(el => 
-                el.children.length === 0 && el.textContent.trim() === '${mode}'
-            );
-
-            if (target) {
-                target.click();
-                await new Promise(r => setTimeout(r, 200));
-                return { success: true };
-            }
-            
-            return { error: 'Mode option text not found in dialog. Dialog text: ' + visibleDialog.innerText.substring(0, 50) };
-
-        } catch(err) {
-            return { error: 'JS Error: ' + err.toString() };
-        }
-    })()`;
-
-    for (const ctx of cdp.contexts) {
-        try {
-            const res = await cdp.call("Runtime.evaluate", {
-                expression: EXP,
-                returnByValue: true,
-                awaitPromise: true,
-                contextId: ctx.id
-            });
-            if (res.result?.value) return res.result.value;
-        } catch (e) { }
-    }
-    return { error: 'Context failed' };
-}
-
 // Stop Generation — cancels generation reliably and clears messageQueue
 async function stopGeneration(cdp) {
     let stopped = false;
@@ -1114,62 +1015,137 @@ async function stopGeneration(cdp) {
     return { success: true, method, clearedQueue: clearedCount };
 }
 
+// Mode state tracking
+let globalActiveMode = 'Fast';
+
+// Set AI Mode
+async function setMode(cdp, mode) {
+    if (!['Fast', 'Planning'].includes(mode)) return { error: 'Invalid mode' };
+    globalActiveMode = mode;
+    console.log(`[MODE] Mode switched to: ${mode}`);
+    return { success: true, mode };
+}
+
 // Click Element (Remote)
-async function clickElement(cdp, { selector, index, textContent }) {
+async function clickElement(cdp, { selector, index = 0, textContent, testId, ariaLabel, tagName }) {
+    const payload = { selector, index, textContent, testId, ariaLabel, tagName };
+    const payloadJson = JSON.stringify(payload);
+
     const EXP = `(async () => {
         try {
-            // Strategy: Find all elements matching the selector
-            // If textContent is provided, filter by that too for safety
-            let elements = Array.from(document.querySelectorAll('${selector}'));
-            
-            if ('${textContent}') {
-                elements = elements.filter(el => el.textContent.includes('${textContent}'));
+            const req = ${payloadJson};
+            let candidates = [];
+
+            // 1. Match by testId (e.g. worked-for-collapsible)
+            if (req.testId) {
+                candidates = Array.from(document.querySelectorAll('[data-testid="' + req.testId + '"]'))
+                    .filter(el => el.offsetParent !== null);
             }
 
-            const target = elements[${index}];
-
-            if (target) {
-                target.click();
-                // Also try clicking the parent if the target is just a label
-                // target.parentElement?.click(); 
-                return { success: true };
+            // 2. Match by aria-label
+            if (candidates.length === 0 && req.ariaLabel) {
+                candidates = Array.from(document.querySelectorAll('[aria-label="' + req.ariaLabel + '"]'))
+                    .filter(el => el.offsetParent !== null);
             }
-            
-            return { error: 'Element not found at index ${index}' };
+
+            // 3. Match by text content (Thought for ..., Worked for ..., Ran ..., etc.)
+            if (candidates.length === 0 && req.textContent) {
+                const searchTxt = (req.textContent || '').trim().toLowerCase();
+                const nlPos = searchTxt.indexOf(String.fromCharCode(10));
+                const firstLine = (nlPos !== -1 ? searchTxt.substring(0, nlPos) : searchTxt).trim();
+
+                const buttonsAndInteractives = Array.from(document.querySelectorAll('button, [role="button"], div, span, summary, pre'));
+                candidates = buttonsAndInteractives.filter(el => {
+                    if (el.offsetParent === null) return false;
+                    const elTxt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    if (!elTxt) return false;
+                    const elNlPos = elTxt.indexOf(String.fromCharCode(10));
+                    const elFirstLine = (elNlPos !== -1 ? elTxt.substring(0, elNlPos) : elTxt).trim();
+                    return elFirstLine === firstLine || elTxt.includes(firstLine) || firstLine.includes(elFirstLine);
+                });
+            }
+
+            // 4. Match by CSS selector fallback
+            if (candidates.length === 0 && req.selector) {
+                try {
+                    candidates = Array.from(document.querySelectorAll(req.selector))
+                        .filter(el => el.offsetParent !== null);
+                } catch(e) {}
+            }
+
+            if (candidates.length === 0) {
+                return { error: 'Element not found', req };
+            }
+
+            // Prefer buttons/interactive elements over generic containers
+            const buttonCandidates = candidates.filter(c => c.tagName === 'BUTTON' || c.getAttribute('role') === 'button' || c.closest('button, [role="button"]'));
+            const pool = buttonCandidates.length > 0 ? buttonCandidates : candidates;
+
+            let target = null;
+            if (typeof req.index === 'number' && req.index >= 0 && req.index < pool.length) {
+                target = pool[req.index];
+            } else {
+                target = pool[pool.length - 1];
+            }
+
+            // If target is inside a button, target the button directly
+            const parentBtn = target.closest('button, [role="button"], summary');
+            if (parentBtn && parentBtn.offsetParent !== null) {
+                target = parentBtn;
+            }
+
+            // Dispatch full pointer and mouse event sequence for React/Radix/VSCode
+            target.focus?.();
+            target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+            target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            target.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+            target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            target.click();
+
+            return {
+                success: true,
+                tag: target.tagName,
+                text: (target.innerText || '').substring(0, 50),
+                expanded: target.getAttribute('aria-expanded')
+            };
         } catch(e) {
             return { error: e.toString() };
         }
     })()`;
 
-    for (const ctx of cdp.contexts) {
+    let bestResult = { error: 'No matching context' };
+    const contextsToTry = [{ id: undefined }, ...(cdp.contexts || [])];
+    for (const ctx of contextsToTry) {
         try {
-            const res = await cdp.call("Runtime.evaluate", {
+            const params = {
                 expression: EXP,
                 returnByValue: true,
-                awaitPromise: true,
-                contextId: ctx.id
-            });
-            if (res.result?.value?.success) return res.result.value;
-        } catch (e) { }
+                awaitPromise: true
+            };
+            if (ctx.id !== undefined) params.contextId = ctx.id;
+            const res = await cdp.call("Runtime.evaluate", params);
+            if (res.result?.value?.success) {
+                return res.result.value;
+            }
+            if (res.result?.value && !res.result.value.error?.includes('Element not found')) {
+                bestResult = res.result.value;
+            }
+        } catch (e) {}
     }
-    return { error: 'Click failed in all contexts' };
+    return bestResult;
 }
 
 // Remote scroll - sync phone scroll to desktop
 async function remoteScroll(cdp, { scrollTop, scrollPercent }) {
-    // Try to scroll the chat container in Antigravity
     const EXPRESSION = `(async () => {
         try {
-            // Find the main scrollable chat container
             const scrollables = [...document.querySelectorAll('#conversation [class*="scroll"], #chat [class*="scroll"], #cascade [class*="scroll"], #conversation [style*="overflow"], #chat [style*="overflow"], #cascade [style*="overflow"]')]
                 .filter(el => el.scrollHeight > el.clientHeight);
             
-            // Also check for the main chat area
             const chatArea = document.querySelector('#conversation .overflow-y-auto, #chat .overflow-y-auto, #cascade .overflow-y-auto, #conversation [data-scroll-area], #chat [data-scroll-area], #cascade [data-scroll-area]');
             if (chatArea) scrollables.unshift(chatArea);
             
             if (scrollables.length === 0) {
-                // Fallback: scroll the main container element
                 const cascade = document.getElementById('conversation') || document.getElementById('chat') || document.getElementById('cascade');
                 if (cascade && cascade.scrollHeight > cascade.clientHeight) {
                     scrollables.push(cascade);
@@ -1180,7 +1156,6 @@ async function remoteScroll(cdp, { scrollTop, scrollPercent }) {
             
             const target = scrollables[0];
             
-            // Use percentage-based scrolling for better sync
             if (${scrollPercent} !== undefined) {
                 const maxScroll = target.scrollHeight - target.clientHeight;
                 target.scrollTop = maxScroll * ${scrollPercent};
@@ -1194,14 +1169,12 @@ async function remoteScroll(cdp, { scrollTop, scrollPercent }) {
         }
     })()`;
 
-    for (const ctx of cdp.contexts) {
+    const contextsToTry = [{ id: undefined }, ...(cdp.contexts || [])];
+    for (const ctx of contextsToTry) {
         try {
-            const res = await cdp.call("Runtime.evaluate", {
-                expression: EXPRESSION,
-                returnByValue: true,
-                awaitPromise: true,
-                contextId: ctx.id
-            });
+            const params = { expression: EXPRESSION, returnByValue: true, awaitPromise: true };
+            if (ctx.id !== undefined) params.contextId = ctx.id;
+            const res = await cdp.call("Runtime.evaluate", params);
             if (res.result?.value?.success) return res.result.value;
         } catch (e) { }
     }
@@ -1684,16 +1657,7 @@ async function hasChatOpen(cdp) {
 async function getAppState(cdp) {
     const EXP = `(async () => {
     try {
-        const state = { mode: 'Unknown', model: 'Unknown' };
-
-        // 1. Get Mode (Fast/Planning)
-        const modeTexts = Array.from(document.querySelectorAll('button:not(:disabled), div[role="button"]:not(:disabled)'))
-            .map(el => el.textContent?.trim())
-            .filter(t => t === 'Fast' || t === 'Planning');
-        
-        if (modeTexts.length > 0) {
-            state.mode = modeTexts[0];
-        }
+        const state = { mode: '${globalActiveMode || "Fast"}', model: 'Unknown' };
 
         // 2. Get Model
         const trigger = document.querySelector('[data-testid="model-selector-trigger"], [data-tooltip-id*="model"]');
@@ -2934,9 +2898,9 @@ async function main() {
 
         // Remote Click
         app.post('/remote-click', async (req, res) => {
-            const { selector, index, textContent } = req.body;
+            const { selector, index, textContent, testId, ariaLabel, tagName } = req.body;
             if (!cdpConnection && !(await ensureCDP())) return res.status(503).json({ error: 'CDP disconnected' });
-            const result = await clickElement(cdpConnection, { selector, index, textContent });
+            const result = await clickElement(cdpConnection, { selector, index, textContent, testId, ariaLabel, tagName });
             res.json(result);
         });
 

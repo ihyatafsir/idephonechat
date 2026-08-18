@@ -147,7 +147,7 @@ function dismissSslBanner() {
 
 checkSslStatus();
 
-// --- Models ---
+// --- Models (Matching Desktop IDE Providers & Submodels) ---
 const MODELS = [
     "Gemini 3.7 Flash High",
     "Gemini 3.6 Flash Medium",
@@ -1620,33 +1620,69 @@ setInterval(fetchAppState, 5000);
 checkChatStatus();
 prefetchHistory();
 
-// --- Interactive Expandable Tool Tabs & Artifact Cards ---
+// --- Interactive Expandable Tool Tabs, Thoughts & Artifact Cards ---
 if (chatContent) {
     chatContent.addEventListener('click', async (e) => {
-        const artifactCard = e.target.closest('.artifact-card') ||
-                             e.target.closest('div.border.rounded-xl') ||
-                             e.target.closest('div:has(> button[draggable="true"])');
+        // 1. Locate interactive trigger container
+        const thoughtBtn = e.target.closest('button:has(span.text-secondary-foreground), button.tabular-nums, button:has(svg), div.relative > button');
+        const workedForBtn = e.target.closest('button[data-testid="worked-for-collapsible"], button[class*="tabular-nums"]');
+        const artifactCard = e.target.closest('.artifact-card, div.border.rounded-xl, div:has(> button[draggable="true"])');
+        const toolRow = e.target.closest('div.group.cursor-pointer, div[role="button"], button');
 
-        const collapsibleBtn = e.target.closest('button[data-testid="worked-for-collapsible"]') ||
-                              e.target.closest('button[class*="tabular-nums"]') ||
-                              e.target.closest('button:has(svg path[d*="517.85-480"])');
+        let targetEl = thoughtBtn || workedForBtn || artifactCard || toolRow;
 
-        const targetEl = artifactCard || collapsibleBtn;
+        // If not found directly, check text content of target or its closest ancestors
+        if (!targetEl) {
+            const candidate = e.target.closest('div, span, p, button');
+            if (candidate) {
+                const txt = (candidate.innerText || candidate.textContent || '').trim();
+                if (/^(Thought|Thinking|Worked for|Ran\b|Explored\b|Running\b)/i.test(txt)) {
+                    targetEl = candidate;
+                }
+            }
+        }
+
         if (!targetEl) return;
+
+        // Extract useful identifiers
+        const rawText = (targetEl.innerText || targetEl.textContent || '').trim();
+        const firstLine = rawText.split('\n')[0].trim();
+        const testId = targetEl.getAttribute('data-testid') || (targetEl.querySelector('[data-testid]')?.getAttribute('data-testid')) || '';
+        const ariaLabel = targetEl.getAttribute('aria-label') || '';
+        const tagName = targetEl.tagName.toLowerCase();
+
+        // Only handle clicks on relevant collapsible/tool/thought/artifact elements
+        const isThought = /Thought|Thinking/i.test(firstLine);
+        const isWorkedFor = /Worked for/i.test(firstLine) || testId === 'worked-for-collapsible';
+        const isTool = /^(Ran|Explored|Running|Run)\b/i.test(firstLine);
+        const isArtifact = targetEl.closest('.artifact-card, div.border.rounded-xl') !== null;
+
+        if (!isThought && !isWorkedFor && !isTool && !isArtifact && !testId) {
+            return; // Not an interactive chat toggle
+        }
 
         e.preventDefault();
         e.stopPropagation();
 
         // Visual tactile feedback
         targetEl.style.opacity = '0.6';
-        targetEl.style.transform = 'scale(0.97)';
+        targetEl.style.transform = 'scale(0.98)';
         setTimeout(() => {
             targetEl.style.opacity = '1';
             targetEl.style.transform = '';
         }, 180);
 
-        const textContent = (targetEl.innerText || '').trim();
-        const testId = targetEl.getAttribute('data-testid') || '';
+        // Find index among elements with similar firstLine
+        let matchIndex = 0;
+        try {
+            const allMatching = Array.from(chatContent.querySelectorAll(tagName))
+                .filter(el => {
+                    const t = (el.innerText || el.textContent || '').trim().split('\n')[0].trim();
+                    return t && (t === firstLine || t.includes(firstLine) || firstLine.includes(t));
+                });
+            const idx = allMatching.indexOf(targetEl);
+            if (idx >= 0) matchIndex = idx;
+        } catch (e) {}
 
         try {
             await fetchWithAuth('/remote-click', {
@@ -1654,16 +1690,19 @@ if (chatContent) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     testId: testId || undefined,
-                    selector: artifactCard ? '.artifact-card, div.border.rounded-xl, button[draggable="true"]' : 'button[data-testid="worked-for-collapsible"], button[class*="tabular-nums"]',
-                    textContent: textContent || undefined
+                    ariaLabel: ariaLabel || undefined,
+                    tagName: tagName,
+                    textContent: firstLine,
+                    index: matchIndex
                 })
             });
 
-            // Fast refresh snapshot
-            setTimeout(loadSnapshot, 200);
-            setTimeout(loadSnapshot, 600);
+            // Fast refresh snapshots so user sees expanded/collapsed state immediately
+            setTimeout(loadSnapshot, 150);
+            setTimeout(loadSnapshot, 400);
+            setTimeout(loadSnapshot, 800);
         } catch (err) {
-            console.warn('Click error:', err);
+            console.warn('Remote click error:', err);
         }
     });
 }
